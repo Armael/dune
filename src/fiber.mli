@@ -16,9 +16,15 @@ val both : 'a t -> 'b t -> ('a * 'b) t
 val all : 'a t list -> 'a list t
 val all_unit : unit t list -> unit t
 
-val try_catch
+type error = exn * Printexc.raw_backtrace
+
+val handle_errors
   :  (unit -> 'a t)
-  -> ('a, exn * Printexc.raw_backtrace) result t
+  -> f:(error -> unit)
+  -> 'a t
+
+(** Return a fiber that will be only be evaluated once *)
+val memoize : 'a t -> 'a t
 
 module Mutex : sig
   type 'a future = 'a t
@@ -56,7 +62,7 @@ and opened_file_desc =
   | Fd      of Unix.file_descr
   | Channel of out_channel
 
-(** Why a Future.t was run *)
+(** Why a Fiber.t was run *)
 type purpose =
   | Internal_job
   | Build_job of Path.t list

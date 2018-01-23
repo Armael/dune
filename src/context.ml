@@ -1,5 +1,5 @@
 open Import
-open Future.O
+open Fiber.O
 
 module Kind = struct
   module Opam = struct
@@ -130,12 +130,12 @@ let get_arch_sixtyfour stdlib_dir =
 
 let opam_config_var ~env ~cache var =
   match Hashtbl.find cache var with
-  | Some _ as x -> Future.return x
+  | Some _ as x -> Fiber.return x
   | None ->
     match Bin.opam with
-    | None -> Future.return None
+    | None -> Fiber.return None
     | Some fn ->
-      Future.run_capture (Accept All) (Path.to_string fn) ~env ["config"; "var"; var]
+      Fiber.run_capture (Accept All) (Path.to_string fn) ~env ["config"; "var"; var]
       >>| function
       | Ok s ->
         let s = String.trim s in
@@ -198,16 +198,16 @@ let create ~(kind : Kind.t) ~path ~base_env ~env_extra ~name ~merlin
          variable, but "ocamlfind printconf conf" still prints the configuration file set
          at the configuration time of ocamlfind, sigh... *)
       match Sys.getenv "OCAMLFIND_CONF" with
-      | s -> Future.return (Path.absolute s)
+      | s -> Fiber.return (Path.absolute s)
       | exception Not_found ->
-        Future.run_capture_line ~env Strict
+        Fiber.run_capture_line ~env Strict
           (Path.to_string fn) ["printconf"; "conf"]
         >>| Path.absolute)
   in
 
   let create_one ~name ~implicit ?findlib_toolchain ?host ~merlin () =
     (match findlib_toolchain with
-     | None -> Future.return None
+     | None -> Fiber.return None
      | Some toolchain ->
        Lazy.force findlib_config_path >>| fun path ->
        Some (Findlib.Config.load path ~toolchain ~context:name))
@@ -262,7 +262,7 @@ let create ~(kind : Kind.t) ~path ~base_env ~env_extra ~name ~merlin
             | None -> args
             | Some s -> "-toolchain" :: s :: args
           in
-          Future.run_capture_lines ~env Strict (Path.to_string fn) args
+          Fiber.run_capture_lines ~env Strict (Path.to_string fn) args
           >>| List.map ~f:Path.absolute
         | None ->
           (* If there no ocamlfind in the PATH, check if we have opam
@@ -275,11 +275,11 @@ let create ~(kind : Kind.t) ~path ~base_env ~env_extra ~name ~merlin
                [dir ^ "/../lib"] *)
             [Path.relative (Path.parent dir) "lib"]
       else
-        Future.return []
+        Fiber.return []
     in
-    Future.both
+    Fiber.both
       findlib_path
-      (Future.run_capture_lines ~env Strict (Path.to_string ocamlc) ["-config"])
+      (Fiber.run_capture_lines ~env Strict (Path.to_string ocamlc) ["-config"])
     >>= fun (findlib_path, ocamlc_config) ->
 
     let ocamlc_config =
@@ -371,7 +371,7 @@ let create ~(kind : Kind.t) ~path ~base_env ~env_extra ~name ~merlin
       | Some ws -> ws = "64"
       | None -> get_arch_sixtyfour stdlib_dir
     in
-    Future.return
+    Fiber.return
       { name
       ; implicit
       ; kind
@@ -438,7 +438,7 @@ let create ~(kind : Kind.t) ~path ~base_env ~env_extra ~name ~merlin
 
   let implicit = not (List.mem ~set:targets Workspace.Context.Target.Native) in
   create_one () ~implicit ~name ~merlin >>= fun native ->
-  Future.all (
+  Fiber.all (
     List.filter_map targets ~f:(function
       | Native -> None
       | Named findlib_toolchain ->
@@ -470,11 +470,11 @@ let create_for_opam ?root ~targets ~switch ~name ?(merlin=false) () =
   | None -> Utils.program_not_found "opam"
   | Some fn ->
     (match root with
-     | Some root -> Future.return root
+     | Some root -> Fiber.return root
      | None ->
-       Future.run_capture_line Strict (Path.to_string fn) ["config"; "var"; "root"])
+       Fiber.run_capture_line Strict (Path.to_string fn) ["config"; "var"; "root"])
     >>= fun root ->
-    Future.run_capture Strict (Path.to_string fn)
+    Fiber.run_capture Strict (Path.to_string fn)
       ["config"; "env"; "--root"; root; "--switch"; switch; "--sexp"]
     >>= fun s ->
     let vars =
@@ -522,12 +522,12 @@ let install_ocaml_libdir t =
   (* If ocamlfind is present, it has precedence over everything else. *)
   match which t "ocamlfind" with
   | Some fn ->
-    (Future.run_capture_line ~env:t.env Strict
+    (Fiber.run_capture_line ~env:t.env Strict
        (Path.to_string fn) ["printconf"; "destdir"]
      >>| fun s ->
      Some (Path.absolute s))
   | None ->
-    Future.return None
+    Fiber.return None
 
 (* CR-someday jdimino: maybe we should just do this for [t.env] directly? *)
 let env_for_exec t =

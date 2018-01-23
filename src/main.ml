@@ -1,5 +1,5 @@
 open Import
-open Future.O
+open Fiber.O
 
 type setup =
   { build_system : Build_system.t
@@ -46,7 +46,7 @@ let setup ?(log=Log.no_log)
         }
   in
 
-  Future.all (
+  Fiber.all (
     List.map workspace.contexts ~f:(fun ctx_def ->
       let name = Workspace.Context.name ctx_def in
       Context.create ctx_def ~merlin:(workspace.merlin_context = Some name) ~use_findlib)
@@ -64,7 +64,7 @@ let setup ?(log=Log.no_log)
     ?only_packages
     ?filter_out_optional_stanzas_with_missing_deps
   >>= fun stanzas ->
-  Future.return
+  Fiber.return
     { build_system
     ; stanzas
     ; contexts
@@ -73,7 +73,7 @@ let setup ?(log=Log.no_log)
     }
 
 let external_lib_deps ?log ~packages () =
-  Future.Scheduler.go ?log
+  Fiber.Scheduler.go ?log
     (setup () ~filter_out_optional_stanzas_with_missing_deps:false
      >>| fun setup ->
      let install_files =
@@ -105,7 +105,7 @@ let bootstrap () =
   let main () =
     let anon s = raise (Arg.Bad (Printf.sprintf "don't know what to do with %s\n" s)) in
     let subst () =
-      Future.Scheduler.go (Watermarks.subst () ~name:"jbuilder");
+      Fiber.Scheduler.go (Watermarks.subst () ~name:"jbuilder");
       exit 0
     in
     Arg.parse
@@ -117,7 +117,7 @@ let bootstrap () =
       anon "Usage: boot.exe [-j JOBS] [--dev]\nOptions are:";
     Clflags.debug_dep_path := true;
     let log = Log.create () in
-    Future.Scheduler.go ~log
+    Fiber.Scheduler.go ~log
       (setup ~log ~workspace:{ merlin_context = Some "default"
                              ; contexts = [Default [Native]] }
          ~use_findlib:false

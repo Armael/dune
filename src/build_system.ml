@@ -59,7 +59,7 @@ end
 
 module Build_result = struct
   (* Unit as error are always reported immediatly. We might want to change that later and
-     use [Build_error.t list], however this require changing [Future] to not report
+     use [Build_error.t list], however this require changing [Fiber] to not report
      command failures immediately. *)
   type 'a t = ('a, unit) result
 end
@@ -67,7 +67,7 @@ end
 (* When we need to fail for an error that has already been reported. *)
 exception Already_reported
 
-(* [Build_process] is a monad similar to [Future] except that it never stops eagerly when
+(* [Build_process] is a monad similar to [Fiber] except that it never stops eagerly when
    an error occurs.
 
    To run some external code, one must use [import_future] or [wrap_exceptions].
@@ -88,15 +88,15 @@ module Build_process : sig
   val all : 'a t list -> 'a list t
   val all_unit : unit t list -> unit t
 
-  val wrap   : 'a Build_result.t Future.t -> 'a t
-  val unwrap : 'a t -> 'a Build_result.t Future.t
+  val wrap   : 'a Build_result.t Fiber.t -> 'a t
+  val unwrap : 'a t -> 'a Build_result.t Fiber.t
 end = struct
-  type 'a t = 'a Build_result.t Future.t
+  type 'a t = 'a Build_result.t Fiber.t
 
-  open Future.O
+  open Fiber.O
 
-  let return x = Future.return (Ok x)
-  let fail () = Future.return (Error ())
+  let return x = Fiber.return (Ok x)
+  let fail () = Fiber.return (Error ())
 
   let wrap t = t
   let unwrap t = t
@@ -105,7 +105,7 @@ end = struct
     let ( >>= ) t f =
       t >>= function
       | Ok x -> f x
-      | Error () as e -> Future.return e
+      | Error () as e -> Fiber.return e
 
     let ( >>| ) t f =
       t >>| function
@@ -116,7 +116,7 @@ end = struct
   let both a b =
     a >>= fun a ->
     b >>= fun b ->
-    Future.return
+    Fiber.return
       (match a, b with
        | Ok a, Ok b -> Ok (a, b)
        | Error (), _ | _, Error () -> Error ())
@@ -124,14 +124,14 @@ end = struct
   let all l =
     let rec loop_ok acc l =
       match l with
-      | [] -> Future.return (Ok (List.rev acc))
+      | [] -> Fiber.return (Ok (List.rev acc))
       | x :: l ->
         x >>= function
         | Ok x -> loop_ok (x :: acc) l
         | Error () -> loop_error l
     and loop_error l=
       match l with
-      | [] -> Future.return (Error ())
+      | [] -> Fiber.return (Error ())
       | x :: l ->
         x >>= function
         | Ok _ -> loop_error l
@@ -142,14 +142,14 @@ end = struct
   let all_unit l =
     let rec loop_ok l =
       match l with
-      | [] -> Future.return (Ok ())
+      | [] -> Fiber.return (Ok ())
       | x :: l ->
         x >>= function
         | Ok () -> loop_ok l
         | Error () -> loop_error l
     and loop_error l =
       match l with
-      | [] -> Future.return (Error ())
+      | [] -> Fiber.return (Error ())
       | x :: l ->
         x >>= function
         | Ok _ -> loop_error l
@@ -474,9 +474,9 @@ let create_build_error t ~targeting ~backtrace exn =
   { Build_error. backtrace; dep_path; exn }
 
 let import_future t ~targeting ~f =
-  let open Future.O in
+  let open Fiber.O in
   Build_process.wrap
-    (Future.try_catch f
+    (Fiber.try_catch f
      >>| function
      | Ok _ as ok -> ok
      | Error (Already_reported, _) ->
@@ -505,7 +505,7 @@ let entry_point t ~f =
    | _ :: _ ->
      code_errorf
        "Build_system.entry_point: called inside the rule generator callback");
-  let open Future.O in
+  let open Fiber.O in
   Build_process.unwrap (f ())
   >>| function
   | Ok x -> x
@@ -646,7 +646,7 @@ let create_file_specs t targets rule ~copy_source =
 let pending_targets = ref Pset.empty
 
 let () =
-  Future.Scheduler.at_exit_after_waiting_for_commands (fun () ->
+  Fiber.Scheduler.at_exit_after_waiting_for_commands (fun () ->
     let fns = !pending_targets in
     pending_targets := Pset.empty;
     Pset.iter fns ~f:Path.unlink_no_err)
@@ -687,14 +687,14 @@ let make_local_parent_dirs t paths ~map_path =
 
 let sandbox_dir = Path.of_string "_build/.sandbox"
 
-let locks : (Path.t, Future.Mutex.t) Hashtbl.t = Hashtbl.create 32
+let locks : (Path.t, Fiber.Mutex.t) Hashtbl.t = Hashtbl.create 32
 
 let rec with_locks mutexes ~f =
   match mutexes with
   | [] -> f ()
   | m :: mutexes ->
-    Future.Mutex.with_lock
-      (Hashtbl.find_or_add locks m ~f:(fun _ -> Future.Mutex.create ()))
+    Fiber.Mutex.with_lock
+      (Hashtbl.find_or_add locks m ~f:(fun _ -> Fiber.Mutex.create ()))
       (fun () -> with_locks mutexes ~f)
 
 let remove_old_artifacts t ~dir ~subdirs_to_keep =
@@ -773,7 +773,7 @@ let rec compile_rule t ?(copy_source=false) pre_rule =
        (action, dyn_deps))
     >>= fun ((), (action, dyn_deps)) ->
     import_future t ~targeting ~f:(fun () ->
-      let open Future.O in
+      let open Fiber.O in
       make_local_parent_dirs t targets ~map_path:(fun x -> x);
       let all_deps = Pset.union static_deps dyn_deps in
       let all_deps_as_list = Pset.elements all_deps in
@@ -859,7 +859,7 @@ let rec compile_rule t ?(copy_source=false) pre_rule =
               ~src:(Path.to_string path)
               ~dst:(Path.to_string in_source_tree))
       ) else
-        Future.return ())
+        Fiber.return ())
   in
   let rule =
     { Internal_rule.

@@ -565,9 +565,9 @@ let chdirs =
   in
   fun t -> loop Path.Set.empty t
 
-open Future.O
+open Fiber.O
 
-let get_std_output : _ -> Future.std_output_to = function
+let get_std_output : _ -> Fiber.std_output_to = function
   | None          -> Terminal
   | Some (fn, oc) -> Opened_file { filename = fn; tail = false; desc = Channel oc }
 
@@ -656,7 +656,7 @@ end
 
 type exec_context =
   { context : Context.t option
-  ; purpose : Future.purpose
+  ; purpose : Fiber.purpose
   ; env     : string array
   }
 
@@ -678,12 +678,12 @@ let exec_run ~ectx ~dir ~env_extra ~stdout_to ~stderr_to prog args =
   let stdout_to = get_std_output stdout_to in
   let stderr_to = get_std_output stderr_to in
   let env = Context.extend_env ~vars:env_extra ~env:ectx.env in
-  Future.run Strict ~dir:(Path.to_string dir) ~env ~stdout_to ~stderr_to
+  Fiber.run Strict ~dir:(Path.to_string dir) ~env ~stdout_to ~stderr_to
     ~purpose:ectx.purpose
     (Path.reach_for_running ~from:dir prog) args
 
 let exec_echo stdout_to str =
-  Future.return
+  Fiber.return
     (match stdout_to with
      | None -> print_string str; flush stdout
      | Some (_, oc) -> output_string oc str)
@@ -701,7 +701,7 @@ let rec exec t ~ectx ~dir ~env_extra ~stdout_to ~stderr_to =
       ~env_extra:(Env_var_map.add env_extra ~key:var ~data:value)
   | Redirect (Stdout, fn, Echo s) ->
     Io.write_file (Path.to_string fn) s;
-    Future.return ()
+    Fiber.return ()
   | Redirect (outputs, fn, t) ->
     redirect ~ectx ~dir outputs fn t ~env_extra ~stdout_to ~stderr_to
   | Ignore (outputs, t) ->
@@ -717,10 +717,10 @@ let rec exec t ~ectx ~dir ~env_extra ~stdout_to ~stderr_to =
         | Some (_, oc) -> oc
       in
       Io.copy_channels ic oc);
-    Future.return ()
+    Fiber.return ()
   | Copy (src, dst) ->
     Io.copy_file ~src:(Path.to_string src) ~dst:(Path.to_string dst);
-    Future.return ()
+    Fiber.return ()
   | Symlink (src, dst) ->
     if Sys.win32 then
       Io.copy_file ~src:(Path.to_string src) ~dst:(Path.to_string dst)
@@ -742,7 +742,7 @@ let rec exec t ~ectx ~dir ~env_extra ~stdout_to ~stderr_to =
       | exception _ ->
         Unix.symlink src dst
     end;
-    Future.return ()
+    Fiber.return ()
   | Copy_and_add_line_directive (src, dst) ->
     Io.with_file_in (Path.to_string src) ~f:(fun ic ->
       Io.with_file_out (Path.to_string dst) ~f:(fun oc ->
@@ -755,7 +755,7 @@ let rec exec t ~ectx ~dir ~env_extra ~stdout_to ~stderr_to =
         in
         Printf.fprintf oc "#%s 1 %S\n" directive (Path.to_string fn);
         Io.copy_channels ic oc));
-    Future.return ()
+    Fiber.return ()
   | System cmd ->
     let path, arg =
       Utils.system_shell_exn ~needed_to:"interpret (system ...) actions"
@@ -767,13 +767,13 @@ let rec exec t ~ectx ~dir ~env_extra ~stdout_to ~stderr_to =
       ["-e"; "-u"; "-o"; "pipefail"; "-c"; cmd]
   | Write_file (fn, s) ->
     Io.write_file (Path.to_string fn) s;
-    Future.return ()
+    Fiber.return ()
   | Rename (src, dst) ->
     Unix.rename (Path.to_string src) (Path.to_string dst);
-    Future.return ()
+    Fiber.return ()
   | Remove_tree path ->
     Path.rm_rf path;
-    Future.return ()
+    Fiber.return ()
   | Mkdir path ->
     (match Path.kind path with
      | External _ ->
@@ -783,7 +783,7 @@ let rec exec t ~ectx ~dir ~env_extra ~stdout_to ~stderr_to =
          [ "mkdir", Path.sexp_of_t path ]
      | Local path ->
        Path.Local.mkdir_p path);
-    Future.return ()
+    Fiber.return ()
   | Digest_files paths ->
     let s =
       let data =
@@ -797,7 +797,7 @@ let rec exec t ~ectx ~dir ~env_extra ~stdout_to ~stderr_to =
   | Diff { optional; file1; file2 } ->
     if (optional && not (Path.exists file1 && Path.exists file2)) ||
        Io.compare_files (Path.to_string file1) (Path.to_string file2) = 0 then
-      Future.return ()
+      Fiber.return ()
     else begin
       let is_copied_from_source_tree file =
         match Path.drop_build_context file with
@@ -830,7 +830,7 @@ and redirect outputs fn t ~ectx ~dir ~env_extra ~stdout_to ~stderr_to =
 and exec_list l ~ectx ~dir ~env_extra ~stdout_to ~stderr_to =
   match l with
   | [] ->
-    Future.return ()
+    Fiber.return ()
   | [t] ->
     exec t ~ectx ~dir ~env_extra ~stdout_to ~stderr_to
   | t :: rest ->
@@ -844,7 +844,7 @@ let exec ~targets ?context t =
     | Some c -> c.env
   in
   let targets = Path.Set.elements targets in
-  let purpose = Future.Build_job targets in
+  let purpose = Fiber.Build_job targets in
   let ectx = { purpose; context; env } in
   exec t ~ectx ~dir:Path.root ~env_extra:Env_var_map.empty
     ~stdout_to:None ~stderr_to:None

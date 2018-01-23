@@ -23,7 +23,7 @@ val setup
   -> ?only_packages:String_set.t
   -> ?x:string
   -> unit
-  -> setup Future.t
+  -> setup Fiber.t
 val external_lib_deps
   : ?log:Log.t
   -> packages:string list

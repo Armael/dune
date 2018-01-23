@@ -1115,7 +1115,7 @@ end
 let gen ~contexts ~build_system
       ?(filter_out_optional_stanzas_with_missing_deps=true)
       ?only_packages conf =
-  let open Future.O in
+  let open Fiber.O in
   let { Jbuild_load. file_tree; jbuilds; packages; scopes } = conf in
   let packages =
     match only_packages with
@@ -1125,7 +1125,7 @@ let gen ~contexts ~build_system
         String_set.mem name pkgs)
   in
   let sctxs = Hashtbl.create 4 in
-  let make_sctx (context : Context.t) : _ Future.t =
+  let make_sctx (context : Context.t) : _ Fiber.t =
     let host =
       Option.map context.for_host ~f:(fun h ->
         Option.value_exn (Hashtbl.find sctxs h.name))
@@ -1162,7 +1162,7 @@ let gen ~contexts ~build_system
     Hashtbl.add sctxs ~key:context.name ~data:sctx;
     (context.name, ((module M : Gen), stanzas))
   in
-  Future.all (List.map ~f:make_sctx contexts) >>| fun l ->
+  Fiber.all (List.map ~f:make_sctx contexts) >>| fun l ->
   let map = String_map.of_alist_exn l in
   Build_system.set_rule_generators build_system
     (String_map.map map ~f:(fun ((module M : Gen), _) -> M.gen_rules));

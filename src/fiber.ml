@@ -1,189 +1,183 @@
 open Import
 
-type 'a or_error = ('a, exn * Printexc.raw_backtrace) result
+type error = exn * Printexc.raw_backtrace
+type 'a or_error = ('a, error) result
 
-type 'a t = { mutable state : 'a state }
+module Handler = struct
+  type 'a t =
+    { run         : 'a -> unit
+    ; exn_handler : (error -> unit) option
+    }
 
-and 'a state =
-  | Return of 'a
-  | Sleep of 'a handlers
-  | Repr of 'a t
+  let run t x =
+    match t.exn_handler with
+    | None -> t.run x
+    | Some f ->
+      try
+        t.run x
+      with exn ->
+        let bt = Printexc.get_raw_backtrace () in
+        f (exn, bt)
+end
 
-and 'a handlers =
-  | Empty  : _ handlers
-  | Bind   : exn_handler * ('a -> 'b t) * 'b t -> 'a handlers
-  | Try    : 'a or_error t -> 'a handlers
-  | Append : 'a handlers * 'a handlers -> 'a handlers
+module Jobs = struct
+  type node =
+    | Many   : 'a * 'a Handler.t Queue.t -> t
+    | Single : 'a * 'a Handler.t -> t
 
-and exn_handler =
-  | Pass_through : exn_handler
-  | Send_to      : 'a or_error t -> exn_handler
+  let queue = Queue.create ()
 
-let exn_handler = ref Pass_through
+  let enqueue jobs x =
+    if not (Queue.is_empty jobs) then
+      Queue.enqueue (Node (x, jobs))
 
-let append h1 h2 =
-  match h1, h2 with
-  | Empty, _ -> h2
-  | _, Empty -> h1
-  | _ -> Append (h1, h2)
+  let rec run () =
+    while not (Queue.is_empty queue) do
+      match Queue.pop queue with
+      | Single (x, h) ->
+        Handler.run h x
+      | Many (x, q) ->
+        Queue.iter q ~f:(fun h -> Handler.run h x)
+    done
+end
 
-let rec repr t =
-  match t.state with
-  | Repr t' -> let t'' = repr t' in if t'' != t' then t.state <- Repr t''; t''
-  | _       -> t
+module Ivar = struct
+  type 'a state =
+    | Full  of 'a
+    | Empty of ('a -> unit) Queue.t
 
-let rec run_handlers : type a. a handlers -> a -> unit = fun handlers x ->
-  let rec loop handlers acc =
-    match handlers with
-    | Empty -> continue acc
-    | Bind (handler, f, res) ->
-      exn_handler := handler;
-      begin
-        match handler with
-        | Pass_through ->
-          connect res (f x)
-        | Send_to ivar ->
-          match f x with
-          | t -> connect res t
-          | exception exn ->
-            let bt = Printexc.get_raw_backtrace () in
-            fill_exn_handler ivar (Error (exn, bt))
-      end;
-      continue acc
-    | Try ivar ->
-      fill_exn_handler ivar (Ok x);
-      continue acc
-    | Append (h1, h2) -> loop h1 (h2 :: acc)
-  and continue = function
-    | [] -> ()
-    | h :: acc -> loop h acc
+  type 'a t = { mutable state : 'a state }
+
+  let create () = { state = Empty }
+
+  let fill t x =
+    match t.state with
+    | Full _ -> failwith "Fiber.Ivar.fill"
+    | Empty q ->
+      t.state <- Full x;
+      Jobs.enqueue q x
+
+  let read t ~f ~exn_handler =
+    match ivar.state with
+    | Full x -> k x
+    | Empty q -> Queue.push { Handler.run = k; exn_handler } q
+end
+
+type 'a t =
+  | Return        : 'a -> 'a t
+  | Bind          : 'a t * ('a -> 'b t) -> 'b t
+  | Map           : 'a t * ('a -> 'b) -> 'b t
+  | Both          : 'a t * 'b t -> ('a * 'b) t
+  | All           : 'a t list -> 'a list t
+  | All_unit      : unit t list -> unit t
+  | Read          : 'a Ivar.t -> 'a t
+  | Fill          : 'a Ivar.t * 'a -> unit t
+  | Memoize       : 'a memo_state ref -> 'a t
+  | Handle_errors : (unit -> 'a t) * (error -> unit) -> 'a t
+  | Primitive     : ('a Handler.t -> unit) -> 'a t
+
+and 'a memo_state =
+  | Pending of 'a t
+  | Started of 'a Ivar.t
+
+type ('a, 'b) both_state =
+  | Nothing_yet
+  | Got_a of 'a
+  | Got_b of 'b
+
+let list_of_option_array =
+  let rec loop arr i acc =
+    if i < 0 then
+      acc
+    else
+      let i = i - 1 in
+      match arr.(i) with
+      | None -> assert false
+      | Some x ->
+        loop arr i (x :: acc)
   in
-  protectx !exn_handler
-    ~finally:(fun saved ->
-      exn_handler := saved)
-    ~f:(fun _ ->
-      loop handlers [])
+  fun a -> loop a (Array.length a) []
 
-and connect : type a. a t -> a t -> unit = fun t1 t2 ->
-  let t1 = repr t1 and t2 = repr t2 in
-  match t1.state with
-  | Sleep h1 ->
-    if t1 == t2 then
-      ()
-    else begin
-      match t2.state with
-      | Repr _ -> assert false
-      | Sleep h2 ->
-        t2.state <- Repr t1;
-        t1.state <- Sleep (append h1 h2)
-      | Return x as state2 ->
-        t1.state <- state2;
-        run_handlers h1 x
+let rec eval ~exn_handler ~k = function
+  | Return x ->
+    k x
+  | Bind (t, f) ->
+    eval ~exn_handler t ~k:(fun x -> eval ~exn_handler (f x) ~k)
+  | Map (t, f) ->
+    eval ~exn_handler t ~k:(fun x -> k (f x))
+  | Read ivar -> Ivar.read ivar ~k ~exn_handler
+  | Fill (ivar, x) -> Ivar.fill ivar x
+  | Both (a, b) ->
+    let state = ref Nothing_yet in
+    let k () =
+      match !res_a, !res_b with
+      | Some a, Some b -> k (a, b)
+      | _ -> ()
+    in
+    eval ~exn_handler a ~k:(fun a ->
+      match !state with
+      | Nothing_yet -> state := Got_a a
+      | Got_a _ -> assert false
+      | Got_b b -> k (a, b));
+    eval ~exn_handler b ~k:(fun b ->
+      match !state with
+      | Nothing_yet -> state := Got_b b
+      | Got_a a -> k (a, b)
+      | Got_b _ -> assert false)
+  | All_unit l ->
+    let left_over = ref (List.length l) in
+    let k () =
+      decr !left_over;
+      if !left_over = 0 then k ()
+    in
+    List.iter l ~f:(fun t -> eval ~exn_handler t ~k)
+  | All l ->
+    let n = List.length l in
+    let left_over = ref n in
+    let results = Array.make n None in
+    List.iteri l ~f:(fun t ->
+      eval ~exn_handler t ~k:(fun x ->
+        results.(i) <- Some x;
+        decr !left_over;
+        if !left_over = 0 then
+          k (list_of_option_array results)))
+  | Memoize memo -> begin
+    match !memo with
+    | Started ivar -> Ivar.read ivar ~k
+    | Pending t ->
+      let ivar = Ivar.create () in
+      state := Started ivar;
+      eval ~exn_handler t ~k:(fun x -> Ivar.fill ivar x)
+  end
+  | Handle_errors (f, exn_handler) -> begin
+      match f () with
+      | exception exn ->
+        let bt = Printexc.raw_backtrace () in
+        exn_handler (exn, bt)
+      | t ->
+        eval t ~exn_handler ~k
     end
-  | _ ->
-    assert false
+  | Primitive f -> f { Handler.run; exn_handler }
 
-and fill_exn_handler : type a. a or_error t -> a or_error -> unit = fun t x ->
-  let t = repr t in
-  match t.state with
-  | Repr   _ -> assert false
-  | Return _ -> ()
-  | Sleep handlers ->
-    t.state <- Return x;
-    run_handlers handlers x
-
-let return x = { state = Return x }
-
-let sleeping () = { state = Sleep Empty }
+let return x = Return x
 
 module O = struct
-  let ( >>= ) t f =
-    let t = repr t in
-    match t.state with
-    | Return v -> f v
-    | Sleep handlers ->
-      let res = sleeping () in
-      t.state <-
-        Sleep (append handlers
-                 (Bind (!exn_handler,
-                        f,
-                        res)));
-      res
-    | Repr _ ->
-      assert false
+  let ( >>= ) : type a. a t -> (a -> b t) -> b t = fun t f ->
+    match t with
+    | Return x -> f x
+    | _ -> Bind (t, f)
 
-  let ( >>| ) t f = t >>= fun x -> return (f x)
+  let ( >>| ) : type a. a t -> (a -> b) -> b t = fun t f ->
+    match t with
+    | Return x -> Return (f x)
+    | _ -> Map (t, f)
 end
 
 open O
 
-let try_catch f =
-  let result = sleeping () in
-  let saved = !exn_handler in
-  exn_handler := Send_to result;
-  match f () with
-  | exception exn ->
-    let bt = Printexc.get_raw_backtrace () in
-    exn_handler := saved;
-    let x = Error (exn, bt) in
-    fill_exn_handler result x;
-    return x
-  | t ->
-    let t = repr t in
-    match t.state with
-    | Repr _ -> assert false
-    | Return v ->
-      let x = Ok v in
-      fill_exn_handler result x;
-      return x
-    | Sleep handlers ->
-      t.state <- Sleep (append handlers (Try result));
-      result
+let memoize t = Memoize (ref (Pending t))
 
-let finalize f ~finally =
-  try_catch f >>| function
-  | Ok x ->
-    finally ();
-    x
-  | Error (exn, _) ->
-    finally ();
-    reraise exn
-
-let both a b =
-  a >>= fun a ->
-  b >>= fun b ->
-  return (a, b)
-
-let create f =
-  let t = sleeping () in
-  f t;
-  t
-
-module Ivar = struct
-  type nonrec 'a t = 'a t
-
-  let fill t x =
-    let t = repr t in
-    match t.state with
-    | Repr _ -> assert false
-    | Return _ -> failwith "Future.Ivar.fill"
-    | Sleep handlers ->
-      t.state <- Return x;
-      run_handlers handlers x
-end
-
-let rec all = function
-  | [] -> return []
-  | x :: l ->
-    x     >>= fun x ->
-    all l >>= fun l ->
-    return (x :: l)
-
-let rec all_unit = function
-  | [] -> return ()
-  | x :: l ->
-    x >>= fun () ->
-    all_unit l
+let handle_errors g ~f = Handle_errors (g, f)
 
 type to_fill = To_fill : 'a Ivar.t * 'a -> to_fill
 
@@ -192,16 +186,18 @@ let to_fill = Queue.create ()
 module Mutex = struct
   type t =
     { mutable locked  : bool
-    ; mutable waiters : unit Ivar.t Queue.t
+    ; mutable waiters : unit Handler.t Queue.t
     }
 
   let lock t =
-    if t.locked then
-      create (fun ivar -> Queue.push ivar t.waiters)
-    else begin
-      t.locked <- true;
-      return ()
-    end
+    Primitive (fun handler ->
+      if t.locked then
+
+    )
+else begin
+  t.locked <- true;
+  return ()
+end
 
   let unlock t =
     assert t.locked;
@@ -263,7 +259,7 @@ and opened_file_desc =
   | Fd      of Unix.file_descr
   | Channel of out_channel
 
-(** Why a Future.t was run *)
+(** Why a Fiber.t was run *)
 type purpose =
   | Internal_job
   | Build_job of Path.t list

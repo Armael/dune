@@ -145,7 +145,7 @@ end with type build_system := t
 val do_build
   :  t
   -> request:(unit, unit) Build.t
-  -> unit Future.t
+  -> unit Fiber.t
 
 (** {2 Other queries} *)
 
@@ -200,7 +200,7 @@ val build_rules
   :  ?recursive:bool (* default false *)
   -> t
   -> request:(unit, unit) Build.t
-  -> Rule.t list Future.t
+  -> Rule.t list Fiber.t
 
 (** {1 Misc} *)
 
