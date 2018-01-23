@@ -90,9 +90,9 @@ end
     extract_requires ~fname:plugin plugin_contents
 
   let eval jbuilds ~(context : Context.t) =
-    let open Future in
+    let open Future.O in
     List.map jbuilds ~f:(function
-      | Literal x -> return x
+      | Literal x -> Future.return x
       | Script { dir; scope } ->
         let file = Path.relative dir "jbuild" in
         let generated_jbuild =
@@ -146,7 +146,7 @@ end
                Did you forgot to call [Jbuild_plugin.V*.send]?"
             (Path.to_string file);
         let sexps = Sexp.load ~fname:(Path.to_string generated_jbuild) ~mode:Many in
-        return (dir, scope, Stanzas.parse scope sexps ~file:generated_jbuild))
+        Future.return (dir, scope, Stanzas.parse scope sexps ~file:generated_jbuild))
     |> Future.all
 end
 

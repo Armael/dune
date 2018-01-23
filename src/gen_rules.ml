@@ -1115,7 +1115,7 @@ end
 let gen ~contexts ~build_system
       ?(filter_out_optional_stanzas_with_missing_deps=true)
       ?only_packages conf =
-  let open Future in
+  let open Future.O in
   let { Jbuild_load. file_tree; jbuilds; packages; scopes } = conf in
   let packages =
     match only_packages with

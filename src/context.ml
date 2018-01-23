@@ -1,5 +1,5 @@
 open Import
-open Future
+open Future.O
 
 module Kind = struct
   module Opam = struct
@@ -130,10 +130,10 @@ let get_arch_sixtyfour stdlib_dir =
 
 let opam_config_var ~env ~cache var =
   match Hashtbl.find cache var with
-  | Some _ as x -> return x
+  | Some _ as x -> Future.return x
   | None ->
     match Bin.opam with
-    | None -> return None
+    | None -> Future.return None
     | Some fn ->
       Future.run_capture (Accept All) (Path.to_string fn) ~env ["config"; "var"; var]
       >>| function
@@ -275,9 +275,9 @@ let create ~(kind : Kind.t) ~path ~base_env ~env_extra ~name ~merlin
                [dir ^ "/../lib"] *)
             [Path.relative (Path.parent dir) "lib"]
       else
-        return []
+        Future.return []
     in
-    both
+    Future.both
       findlib_path
       (Future.run_capture_lines ~env Strict (Path.to_string ocamlc) ["-config"])
     >>= fun (findlib_path, ocamlc_config) ->
@@ -371,7 +371,7 @@ let create ~(kind : Kind.t) ~path ~base_env ~env_extra ~name ~merlin
       | Some ws -> ws = "64"
       | None -> get_arch_sixtyfour stdlib_dir
     in
-    return
+    Future.return
       { name
       ; implicit
       ; kind
@@ -470,7 +470,7 @@ let create_for_opam ?root ~targets ~switch ~name ?(merlin=false) () =
   | None -> Utils.program_not_found "opam"
   | Some fn ->
     (match root with
-     | Some root -> return root
+     | Some root -> Future.return root
      | None ->
        Future.run_capture_line Strict (Path.to_string fn) ["config"; "var"; "root"])
     >>= fun root ->
@@ -527,7 +527,7 @@ let install_ocaml_libdir t =
      >>| fun s ->
      Some (Path.absolute s))
   | None ->
-    return None
+    Future.return None
 
 (* CR-someday jdimino: maybe we should just do this for [t.env] directly? *)
 let env_for_exec t =

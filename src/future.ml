@@ -1,6 +1,6 @@
 open Import
 
-type exn_handler = exn -> Printexc.raw_backtrace -> unit
+type 'a or_error = ('a, exn * Printexc.raw_backtrace) result
 
 type 'a t = { mutable state : 'a state }
 
@@ -10,11 +10,16 @@ and 'a state =
   | Repr of 'a t
 
 and 'a handlers =
-  | Empty
-  | One    of exn_handler * ('a -> unit)
-  | Append of 'a handlers * 'a handlers
+  | Empty  : _ handlers
+  | Bind   : exn_handler * ('a -> 'b t) * 'b t -> 'a handlers
+  | Try    : 'a or_error t -> 'a handlers
+  | Append : 'a handlers * 'a handlers -> 'a handlers
 
-let exn_handler = ref (fun exn _ -> reraise exn)
+and exn_handler =
+  | Pass_through : exn_handler
+  | Send_to      : 'a or_error t -> exn_handler
+
+let exn_handler = ref Pass_through
 
 let append h1 h2 =
   match h1, h2 with
@@ -27,17 +32,26 @@ let rec repr t =
   | Repr t' -> let t'' = repr t' in if t'' != t' then t.state <- Repr t''; t''
   | _       -> t
 
-let run_handlers handlers x =
+let rec run_handlers : type a. a handlers -> a -> unit = fun handlers x ->
   let rec loop handlers acc =
     match handlers with
     | Empty -> continue acc
-    | One (handler, f) ->
+    | Bind (handler, f, res) ->
       exn_handler := handler;
-      (try
-         f x
-       with exn ->
-         let bt = Printexc.get_raw_backtrace () in
-         handler exn bt);
+      begin
+        match handler with
+        | Pass_through ->
+          connect res (f x)
+        | Send_to ivar ->
+          match f x with
+          | t -> connect res t
+          | exception exn ->
+            let bt = Printexc.get_raw_backtrace () in
+            fill_exn_handler ivar (Error (exn, bt))
+      end;
+      continue acc
+    | Try ivar ->
+      fill_exn_handler ivar (Ok x);
       continue acc
     | Append (h1, h2) -> loop h1 (h2 :: acc)
   and continue = function
@@ -46,11 +60,11 @@ let run_handlers handlers x =
   in
   protectx !exn_handler
     ~finally:(fun saved ->
-        exn_handler := saved)
+      exn_handler := saved)
     ~f:(fun _ ->
-        loop handlers [])
+      loop handlers [])
 
-let connect t1 t2 =
+and connect : type a. a t -> a t -> unit = fun t1 t2 ->
   let t1 = repr t1 and t2 = repr t2 in
   match t1.state with
   | Sleep h1 ->
@@ -69,45 +83,71 @@ let connect t1 t2 =
   | _ ->
     assert false
 
+and fill_exn_handler : type a. a or_error t -> a or_error -> unit = fun t x ->
+  let t = repr t in
+  match t.state with
+  | Repr   _ -> assert false
+  | Return _ -> ()
+  | Sleep handlers ->
+    t.state <- Return x;
+    run_handlers handlers x
+
 let return x = { state = Return x }
 
 let sleeping () = { state = Sleep Empty }
 
-let ( >>= ) t f =
-  let t = repr t in
-  match t.state with
-  | Return v -> f v
-  | Sleep handlers ->
-    let res = sleeping () in
-    t.state <- Sleep (append handlers (One (!exn_handler,
-                                            fun x -> connect res (f x))));
-    res
-  | Repr _ ->
-    assert false
+module O = struct
+  let ( >>= ) t f =
+    let t = repr t in
+    match t.state with
+    | Return v -> f v
+    | Sleep handlers ->
+      let res = sleeping () in
+      t.state <-
+        Sleep (append handlers
+                 (Bind (!exn_handler,
+                        f,
+                        res)));
+      res
+    | Repr _ ->
+      assert false
 
-let ( >>| ) t f = t >>= fun x -> return (f x)
+  let ( >>| ) t f = t >>= fun x -> return (f x)
+end
 
-let with_exn_handler f ~handler =
+open O
+
+let try_catch f =
+  let result = sleeping () in
   let saved = !exn_handler in
-  exn_handler := handler;
+  exn_handler := Send_to result;
   match f () with
-  | x -> exn_handler := saved; x
   | exception exn ->
     let bt = Printexc.get_raw_backtrace () in
     exn_handler := saved;
-    handler exn bt;
-    reraise exn
+    let x = Error (exn, bt) in
+    fill_exn_handler result x;
+    return x
+  | t ->
+    let t = repr t in
+    match t.state with
+    | Repr _ -> assert false
+    | Return v ->
+      let x = Ok v in
+      fill_exn_handler result x;
+      return x
+    | Sleep handlers ->
+      t.state <- Sleep (append handlers (Try result));
+      result
 
 let finalize f ~finally =
-  let finalize = lazy(finally ()) in
-  with_exn_handler
-    (fun () ->
-       f () >>| fun x ->
-       Lazy.force finalize;
-       x)
-    ~handler:(fun exn _ ->
-      Lazy.force finalize;
-      reraise exn)
+  try_catch f >>| function
+  | Ok x ->
+    finally ();
+    x
+  | Error (exn, _) ->
+    finally ();
+    reraise exn
 
 let both a b =
   a >>= fun a ->

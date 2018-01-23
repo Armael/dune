@@ -5,15 +5,20 @@ open Import
 type 'a t
 
 val return : 'a -> 'a t
-val (>>=) : 'a t -> ('a -> 'b t) -> 'b t
-val (>>|) : 'a t -> ('a -> 'b) -> 'b t
+
+module O : sig
+  val (>>=) : 'a t -> ('a -> 'b t) -> 'b t
+  val (>>|) : 'a t -> ('a -> 'b) -> 'b t
+end
 
 val both : 'a t -> 'b t -> ('a * 'b) t
 
 val all : 'a t list -> 'a list t
 val all_unit : unit t list -> unit t
 
-val with_exn_handler : (unit -> 'a) -> handler:(exn -> Printexc.raw_backtrace -> unit) -> 'a
+val try_catch
+  :  (unit -> 'a t)
+  -> ('a, exn * Printexc.raw_backtrace) result t
 
 module Mutex : sig
   type 'a future = 'a t

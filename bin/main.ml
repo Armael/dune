@@ -1,13 +1,11 @@
 open Jbuilder
 open Import
 open Jbuilder_cmdliner.Cmdliner
+open Future.O
 
 (* Things in src/ don't depend on cmdliner to speed up the bootstrap, so we set this
    reference here *)
 let () = suggest_function := Jbuilder_cmdliner.Cmdliner_suggest.value
-
-let (>>=) = Future.(>>=)
-let (>>|) = Future.(>>|)
 
 type common =
   { concurrency      : int
@@ -112,7 +110,7 @@ let request_of_targets (setup : Main.setup) targets =
         ~file_tree:setup.file_tree ~contexts)
 
 let do_build (setup : Main.setup) targets =
-  Build_system.do_build_exn setup.build_system
+  Build_system.do_build setup.build_system
     ~request:(request_of_targets setup targets)
 
 let find_root () =
@@ -1177,5 +1175,5 @@ let () =
     | `Error _ -> exit 1
     | _ -> exit 0
   with exn ->
-    Format.eprintf "%a@?" (Main.report_error ?map_fname:None) exn;
+    Format.eprintf "%a@?" Report_error.report exn;
     exit 1

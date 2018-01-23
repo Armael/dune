@@ -1,6 +1,6 @@
 open Import
 
-let ( >>= ) = Future.( >>= )
+open Future.O
 
 let print path1 path2 =
   let dir, file1, file2 =

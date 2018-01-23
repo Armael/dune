@@ -1,7 +1,7 @@
 open Import
 open Jbuilder_opam_file_format
 
-let ( >>= ) = Future.( >>= )
+open Future.O
 
 let is_a_source_file fn =
   match Filename.extension fn with

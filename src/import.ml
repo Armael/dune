@@ -36,9 +36,25 @@ let ksprintf = Printf.ksprintf
 
 let initial_cwd = Sys.getcwd ()
 
+let err_buf = Buffer.create 128
+let err_ppf (* Referenced in Ansi_color *) = Format.formatter_of_buffer err_buf
+let kerrf fmt ~f =
+  Format.kfprintf
+    (fun ppf ->
+       Format.pp_print_flush ppf ();
+       let s = Buffer.contents err_buf in
+       Buffer.clear err_buf;
+       f s)
+    err_ppf fmt
+
 (* An error in the code of jbuild, that should be reported upstream *)
 exception Code_error of string
-let code_errorf fmt = ksprintf (fun msg -> raise (Code_error msg)) fmt
+let code_errorf fmt =
+  kerrf fmt ~f:(fun s -> raise (Code_error s))
+
+exception Fatal_error of string
+let die fmt =
+  kerrf fmt ~f:(fun s -> raise (Fatal_error s))
 
 type ('a, 'b) result =
   | Ok    of 'a
@@ -494,18 +510,6 @@ let protectx x ~finally ~f =
   match f x with
   | y           -> finally x; y
   | exception e -> finally x; raise e
-
-exception Fatal_error of string
-let die_buf = Buffer.create 128
-let die_ppf (* Referenced in Ansi_color *) = Format.formatter_of_buffer die_buf
-let die fmt =
-  Format.kfprintf
-    (fun ppf ->
-       Format.pp_print_flush ppf ();
-       let s = Buffer.contents die_buf in
-       Buffer.clear die_buf;
-       raise (Fatal_error s))
-    die_ppf fmt
 
 let warn fmt =
   ksprintf (fun msg ->
