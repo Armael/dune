@@ -49,28 +49,36 @@ module Dep_path = struct
 end
 
 let report_build_error dep_path exn =
-  let backtrace = Printexc.get_raw_backtrace () in
-  let ppf = Format.err_formatter in
-  let bt_printed =
-    Report_error.report_with_backtrace ppf exn ~backtrace
-  in
-  if !Clflags.debug_dep_path then
-    Format.fprintf ppf "Dependency path:\n    %s\n"
-      (String.concat ~sep:"\n--> "
-         (List.map dep_path ~f:Utils.describe_target));
-  if not bt_printed && !Clflags.debug_backtraces then
-    Format.fprintf ppf "Backtrace:\n%s"
-      (Printexc.raw_backtrace_to_string backtrace)
+  match exn with
+  | Fiber.Already_reported -> ()
+  | _ ->
+    let backtrace = Printexc.get_raw_backtrace () in
+    let ppf = Format.err_formatter in
+    let bt_printed =
+      Report_error.report_with_backtrace ppf exn ~backtrace
+    in
+    if !Clflags.debug_dep_path then
+      Format.fprintf ppf "Dependency path:\n    %s\n"
+        (String.concat ~sep:"\n--> "
+           (List.map dep_path ~f:Utils.describe_target));
+    if not bt_printed && !Clflags.debug_backtraces then
+      Format.fprintf ppf "Backtrace:\n%s"
+        (Printexc.raw_backtrace_to_string backtrace);
+    Format.pp_print_flush ppf ()
 
 let memoize_for path f =
   Fiber.memoize
     (Dep_path.push path (fun dep_path ->
-       Fiber.iter_errors f ~on_error:(report_build_error dep_path)))
+       Fiber.iter_errors f ~on_error:(report_build_error dep_path)
+       >>| function
+       | Ok x -> x
+       | Error () -> raise Fiber.Already_reported
+     ))
 
 module Exec_status = struct
   module Evaluating_rule = struct
     type t =
-      { rule_evaliation : (Action.t * Pset.t) Fiber.t
+      { rule_evaluation : (Action.t * Pset.t) Fiber.t
       ; exec_rule       : (Action.t * Pset.t) Fiber.t -> unit Fiber.t
       }
   end
@@ -80,7 +88,7 @@ module Exec_status = struct
            dependencies. *)
         rule_evaluation : (Action.t * Pset.t) Fiber.t
       ; (* Ivar that waits for the action to terminate *)
-        rule_execution  : unit Fiber.Ivar.t
+        rule_execution  : unit Fiber.t
       }
   end
   module Not_started = struct
@@ -351,52 +359,6 @@ let get_dir_status t ~dir =
           }
     end)
 
-let find_file_exn t file =
-  Hashtbl.find_exn t.files file
-    ~string_of_key:(fun fn -> sprintf "%S" (Path.to_string fn))
-    ~table_desc:(fun _ -> "<target to rule>")
-
-let create_build_error t ~targeting ~backtrace exn =
-  let rec build_path acc targeting ~seen =
-    assert (not (Pset.mem targeting seen));
-    let seen = Pset.add targeting seen in
-    let (File_spec.T file) = find_file_exn t targeting in
-    match file.rule.exec with
-    | Not_started _ -> assert false
-    | Running { for_file; _ } | Starting { for_file }
-    | Evaluating_rule { for_file; _ } ->
-      if for_file = targeting then
-        acc
-      else
-        build_path (for_file :: acc) for_file ~seen
-  in
-  let dep_path = build_path [targeting] targeting ~seen:Pset.empty in
-  { Build_error. backtrace; dep_path; exn }
-
-let import_future t ~targeting ~f =
-  Fiber.wrap
-    (Fiber.try_catch f
-     >>| function
-     | Ok _ as ok -> ok
-     | Error (Already_reported, _) ->
-       Error ()
-     | Error (exn, backtrace) ->
-       Build_error.report
-         (create_build_error t exn ~targeting ~backtrace);
-       Error ())
-
-let wrap_exceptions t ~targeting ~f =
-  try
-    f ()
-  with
-  | Already_reported ->
-    Fiber.fail ()
-  | exn ->
-    let backtrace = Printexc.get_raw_backtrace () in
-    Build_error.report
-      (create_build_error t exn ~targeting ~backtrace);
-    Fiber.fail ()
-
 let entry_point t ~f =
   (match t.load_dir_stack with
    | [] ->
@@ -404,10 +366,7 @@ let entry_point t ~f =
    | _ :: _ ->
      code_errorf
        "Build_system.entry_point: called inside the rule generator callback");
-  Fiber.unwrap (f ())
-  >>| function
-  | Ok x -> x
-  | Error () -> die ""
+  f ()
 
 module Target = Build_interpret.Target
 module Pre_rule = Build_interpret.Rule
@@ -789,7 +748,7 @@ and targets_of t ~dir =         load_dir_and_get_targets t ~dir
 
 and load_dir_and_get_targets t ~dir =
   match get_dir_status t ~dir with
-  | Failed_to_load -> raise Already_reported
+  | Failed_to_load -> raise Fiber.Already_reported
 
   | Loaded targets -> targets
 
@@ -1005,20 +964,20 @@ The following targets are not:
 and wait_for_file t fn =
   Fiber.wrap_exn (fun () ->
     match Hashtbl.find t.files fn with
-    | Some file -> wait_for_file_found t fn file
+    | Some file -> wait_for_file_found fn file
     | None ->
       let dir = Path.parent fn in
       if Path.is_in_build_dir dir then begin
         load_dir t ~dir;
         match Hashtbl.find t.files fn with
-        | Some file -> wait_for_file_found t fn file
+        | Some file -> wait_for_file_found fn file
         | None -> no_rule_found t fn
       end else if Path.exists fn then
         Fiber.return ()
       else
         die "File unavailable: %s" (Path.to_string_maybe_quoted fn))
 
-and wait_for_file_found t fn (File_spec.T file) =
+and wait_for_file_found fn (File_spec.T file) =
   match file.rule.exec with
   | Not_started { eval_rule; exec_rule } ->
     file.rule.exec <- Starting;
@@ -1034,37 +993,31 @@ and wait_for_file_found t fn (File_spec.T file) =
     file.rule.exec <- Starting;
     let rule_execution = memoize_for fn (fun () -> exec_rule rule_evaluation) in
     file.rule.exec <-
-      Running { for_file
-              ; rule_evaluation
+      Running { rule_evaluation
               ; rule_execution
               };
     rule_execution
   | Starting ->
     (* Recursive deps! *)
     Dep_path.get >>= fun dep_path ->
-    
-    let rec build_loop acc targeting =
-      let acc = targeting :: acc in
-      if fn = targeting then
-        acc
-      else
-        let (File_spec.T file) = find_file_exn t targeting in
-        match file.rule.exec with
-        | Not_started _ | Running _ | Evaluating_rule _ -> assert false
-        | Starting { for_file } ->
-          build_loop acc for_file
+    let rec build_loop acc dep_path =
+      match dep_path with
+      | [] -> assert false
+      | path :: dep_path ->
+        let acc = path :: acc in
+        if fn = path then
+          acc
+        else
+          build_loop acc dep_path
     in
-    let loop = build_loop [fn] targeting in
+    let loop = build_loop [fn] dep_path in
     die "Dependency cycle between the following files:\n    %s"
       (String.concat ~sep:"\n--> "
          (List.map loop ~f:Path.to_string))
 
 and wait_for_deps t deps =
-  Fiber.all
+  Fiber.all_unit
     (Pset.fold deps ~init:[] ~f:(fun fn acc -> wait_for_file t fn :: acc))
-  >>| fun l ->
-  if List.exists l ~f:(function Ok _ -> false | Error () -> true) then
-    raise Already_reported
 
 let stamp_file_for_files_of t ~dir ~ext =
   let files_of_dir =
@@ -1178,8 +1131,7 @@ let eval_request t ~request ~process_target =
 
   Fiber.both
     (process_targets static_deps)
-    (Fiber.all_unit (List.map (Pset.elements rule_deps) ~f:(fun fn ->
-       wait_for_file t fn ~targeting:fn))
+    (wait_for_deps t rule_deps
      >>= fun () ->
      let dyn_deps = Build_exec.exec_nop t request () in
      process_targets (Pset.diff dyn_deps static_deps))
@@ -1187,8 +1139,7 @@ let eval_request t ~request ~process_target =
 
 let do_build t ~request =
   entry_point t ~f:(fun () ->
-    eval_request t ~request ~process_target:(fun fn ->
-      wait_for_file t fn ~targeting:fn))
+    eval_request t ~request ~process_target:(wait_for_file t))
 
 module Ir_set = Set.Make(Internal_rule)
 
@@ -1296,13 +1247,7 @@ let build_rules_internal ?(recursive=false) t ~request =
   let rules = ref [] in
   let rec loop fn =
     let dir = Path.parent fn in
-    (if Path.is_in_build_dir dir then
-       wrap_exceptions t ~targeting:fn ~f:(fun () ->
-         load_dir t ~dir;
-         Fiber.return ())
-     else
-       Fiber.return ())
-    >>= fun () ->
+    if Path.is_in_build_dir dir then load_dir t ~dir;
     match Hashtbl.find t.files fn with
     | Some file ->
       file_found fn file
@@ -1325,15 +1270,14 @@ let build_rules_internal ?(recursive=false) t ~request =
           }
         in
         match ir.exec with
-        | Starting _ -> assert false (* guarded by [rules_seen] *)
+        | Starting -> assert false (* guarded by [rules_seen] *)
         | Running { rule_evaluation; _ } | Evaluating_rule { rule_evaluation; _ } ->
           make_rule rule_evaluation
         | Not_started { eval_rule; exec_rule } ->
-          ir.exec <- Starting { for_file = fn };
-          let rule_evaluation = eval_rule ~targeting:fn in
+          ir.exec <- Starting;
+          let rule_evaluation = memoize_for fn eval_rule in
           ir.exec <-
-            Evaluating_rule { for_file = fn
-                            ; rule_evaluation
+            Evaluating_rule { rule_evaluation
                             ; exec_rule
                             };
           make_rule rule_evaluation
@@ -1390,7 +1334,7 @@ let get_collector t ~dir =
     if collector.rules = [] && String_map.is_empty collector.aliases then
       add_build_dir_to_keep t ~dir;
     collector
-  | Failed_to_load -> raise Already_reported
+  | Failed_to_load -> raise Fiber.Already_reported
   | Loaded _ | Forward _ ->
     Sexp.code_error
       (if Path.is_in_source_tree dir then

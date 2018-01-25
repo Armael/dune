@@ -129,7 +129,10 @@ let bootstrap () =
   in
   try
     main ()
-  with exn ->
+  with
+  | Fiber.Already_reported ->
+    exit 1
+  | exn ->
     Format.eprintf "%a@?" Report_error.report exn;
     exit 1
 

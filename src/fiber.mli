@@ -27,7 +27,7 @@ module O : sig
   val (>>|) : 'a t -> ('a -> 'b) -> 'b t
 end
 
-exception Previously_failed
+exception Already_reported
 
 val memoize : 'a t -> 'a t
 
@@ -141,7 +141,7 @@ module Mutex : sig
   type 'a fiber = 'a t
   type t
   val create : unit -> t
-  val with_lock : t -> 'a fiber -> 'a fiber
+  val with_lock : t -> (unit -> 'a fiber) -> 'a fiber
 end with type 'a fiber := 'a t
 
 (** {1 Running external programs} *)
