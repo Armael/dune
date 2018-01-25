@@ -1,4 +1,5 @@
 open Import
+open Fiber.O
 
 module Pset  = Path.Set
 module Pmap  = Path.Map
@@ -36,162 +37,61 @@ end
 let files_in_source_tree_to_delete () =
   Promoted_to_delete.load ()
 
-module Build_error = struct
-  type t =
-    { backtrace : Printexc.raw_backtrace
-    ; dep_path  : Path.t list
-    ; exn       : exn
-    }
+module Dep_path = struct
+  let var = Fiber.Var.create ()
 
-  let report { backtrace; exn; dep_path } =
-    let ppf = Format.err_formatter in
-    let bt_printed =
-      Report_error.report_with_backtrace ppf exn ~backtrace
-    in
-    if !Clflags.debug_dep_path then
-      Format.fprintf ppf "Dependency path:\n    %s\n"
-        (String.concat ~sep:"\n--> "
-           (List.map dep_path ~f:Utils.describe_target));
-    if not bt_printed && !Clflags.debug_backtraces then
-      Format.fprintf ppf "Backtrace:\n%s"
-        (Printexc.raw_backtrace_to_string backtrace)
+  let get = Fiber.Var.get var >>| Option.value ~default:[]
+
+  let push path f =
+    get >>= fun l ->
+    let l = path :: l in
+    Fiber.Var.set var l (f l)
 end
 
-module Build_result = struct
-  (* Unit as error are always reported immediatly. We might want to change that later and
-     use [Build_error.t list], however this require changing [Fiber] to not report
-     command failures immediately. *)
-  type 'a t = ('a, unit) result
-end
+let report_build_error dep_path exn =
+  let backtrace = Printexc.get_raw_backtrace () in
+  let ppf = Format.err_formatter in
+  let bt_printed =
+    Report_error.report_with_backtrace ppf exn ~backtrace
+  in
+  if !Clflags.debug_dep_path then
+    Format.fprintf ppf "Dependency path:\n    %s\n"
+      (String.concat ~sep:"\n--> "
+         (List.map dep_path ~f:Utils.describe_target));
+  if not bt_printed && !Clflags.debug_backtraces then
+    Format.fprintf ppf "Backtrace:\n%s"
+      (Printexc.raw_backtrace_to_string backtrace)
 
-(* When we need to fail for an error that has already been reported. *)
-exception Already_reported
-
-(* [Build_process] is a monad similar to [Fiber] except that it never stops eagerly when
-   an error occurs.
-
-   To run some external code, one must use [import_future] or [wrap_exceptions].
-*)
-module Build_process : sig
-  type 'a t
-
-  val return : 'a -> 'a t
-  val fail : unit -> 'a t
-
-  module O : sig
-    val (>>=) : 'a t -> ('a -> 'b t) -> 'b t
-    val (>>|) : 'a t -> ('a -> 'b) -> 'b t
-  end
-
-  val both : 'a t -> 'b t -> ('a * 'b) t
-
-  val all : 'a t list -> 'a list t
-  val all_unit : unit t list -> unit t
-
-  val wrap   : 'a Build_result.t Fiber.t -> 'a t
-  val unwrap : 'a t -> 'a Build_result.t Fiber.t
-end = struct
-  type 'a t = 'a Build_result.t Fiber.t
-
-  open Fiber.O
-
-  let return x = Fiber.return (Ok x)
-  let fail () = Fiber.return (Error ())
-
-  let wrap t = t
-  let unwrap t = t
-
-  module O = struct
-    let ( >>= ) t f =
-      t >>= function
-      | Ok x -> f x
-      | Error () as e -> Fiber.return e
-
-    let ( >>| ) t f =
-      t >>| function
-      | Ok x -> Ok (f x)
-      | Error () as e -> e
-  end
-
-  let both a b =
-    a >>= fun a ->
-    b >>= fun b ->
-    Fiber.return
-      (match a, b with
-       | Ok a, Ok b -> Ok (a, b)
-       | Error (), _ | _, Error () -> Error ())
-
-  let all l =
-    let rec loop_ok acc l =
-      match l with
-      | [] -> Fiber.return (Ok (List.rev acc))
-      | x :: l ->
-        x >>= function
-        | Ok x -> loop_ok (x :: acc) l
-        | Error () -> loop_error l
-    and loop_error l=
-      match l with
-      | [] -> Fiber.return (Error ())
-      | x :: l ->
-        x >>= function
-        | Ok _ -> loop_error l
-        | Error () -> loop_error l
-    in
-    loop_ok [] l
-
-  let all_unit l =
-    let rec loop_ok l =
-      match l with
-      | [] -> Fiber.return (Ok ())
-      | x :: l ->
-        x >>= function
-        | Ok () -> loop_ok l
-        | Error () -> loop_error l
-    and loop_error l =
-      match l with
-      | [] -> Fiber.return (Error ())
-      | x :: l ->
-        x >>= function
-        | Ok _ -> loop_error l
-        | Error () -> loop_error l
-    in
-    loop_ok l
-end
-
-open Build_process.O
+let memoize_for path f =
+  Fiber.memoize
+    (Dep_path.push path (fun dep_path ->
+       Fiber.iter_errors f ~on_error:(report_build_error dep_path)))
 
 module Exec_status = struct
-  module Starting = struct
-    type t = { for_file : Path.t }
-  end
   module Evaluating_rule = struct
     type t =
-      { for_file        : Path.t
-      ; rule_evaluation : (Action.t * Pset.t) Build_process.t
-      ; exec_rule       : targeting:Path.t
-          -> (Action.t * Pset.t) Build_process.t -> unit Build_process.t
+      { rule_evaliation : (Action.t * Pset.t) Fiber.t
+      ; exec_rule       : (Action.t * Pset.t) Fiber.t -> unit Fiber.t
       }
   end
   module Running = struct
     type t =
-      { for_file        : Path.t
-      ; (* Build_process that only waits for the evaluation of the rule to terminate.
-           It holds the computed action and dynamic dependencies. *)
-        rule_evaluation : (Action.t * Pset.t) Build_process.t
-      ; (* Build_process that waits for the rule's action to terminate *)
-        rule_execution  : unit Build_process.t
+      { (* Ivar that only holds the computed action and dynamic
+           dependencies. *)
+        rule_evaluation : (Action.t * Pset.t) Fiber.t
+      ; (* Ivar that waits for the action to terminate *)
+        rule_execution  : unit Fiber.Ivar.t
       }
   end
   module Not_started = struct
     type t =
-      { eval_rule : targeting:Path.t -> (Action.t * Pset.t) Build_process.t
-      ; exec_rule : targeting:Path.t -> (Action.t * Pset.t) Build_process.t
-          -> unit Build_process.t
+      { eval_rule : unit -> (Action.t * Pset.t) Fiber.t
+      ; exec_rule : (Action.t * Pset.t) Fiber.t -> unit Fiber.t
       }
   end
   type t =
     | Not_started     of Not_started.t
-    | Starting        of Starting.t
+    | Starting
     | Evaluating_rule of Evaluating_rule.t
     | Running         of Running.t
 end
@@ -474,8 +374,7 @@ let create_build_error t ~targeting ~backtrace exn =
   { Build_error. backtrace; dep_path; exn }
 
 let import_future t ~targeting ~f =
-  let open Fiber.O in
-  Build_process.wrap
+  Fiber.wrap
     (Fiber.try_catch f
      >>| function
      | Ok _ as ok -> ok
@@ -491,12 +390,12 @@ let wrap_exceptions t ~targeting ~f =
     f ()
   with
   | Already_reported ->
-    Build_process.fail ()
+    Fiber.fail ()
   | exn ->
     let backtrace = Printexc.get_raw_backtrace () in
     Build_error.report
       (create_build_error t exn ~targeting ~backtrace);
-    Build_process.fail ()
+    Fiber.fail ()
 
 let entry_point t ~f =
   (match t.load_dir_stack with
@@ -505,8 +404,7 @@ let entry_point t ~f =
    | _ :: _ ->
      code_errorf
        "Build_system.entry_point: called inside the rule generator callback");
-  let open Fiber.O in
-  Build_process.unwrap (f ())
+  Fiber.unwrap (f ())
   >>| function
   | Ok x -> x
   | Error () -> die ""
@@ -759,107 +657,105 @@ let rec compile_rule t ?(copy_source=false) pre_rule =
       } = Build_interpret.static_deps build ~all_targets:(targets_of t)
   in
 
-  let eval_rule ~targeting =
-    wait_for_deps t rule_deps ~targeting
+  let eval_rule () =
+    wait_for_deps t rule_deps
     >>| fun () ->
     Build_exec.exec t build ()
   in
-  let exec_rule ~targeting rule_evaluation =
-    Build_process.both
-      (wait_for_deps t static_deps ~targeting)
+  let exec_rule rule_evaluation =
+    Fiber.both
+      (wait_for_deps t static_deps)
       (rule_evaluation >>= fun (action, dyn_deps) ->
-       wait_for_deps t ~targeting (Pset.diff dyn_deps static_deps)
+       wait_for_deps t (Pset.diff dyn_deps static_deps)
        >>| fun () ->
        (action, dyn_deps))
     >>= fun ((), (action, dyn_deps)) ->
-    import_future t ~targeting ~f:(fun () ->
-      let open Fiber.O in
-      make_local_parent_dirs t targets ~map_path:(fun x -> x);
-      let all_deps = Pset.union static_deps dyn_deps in
-      let all_deps_as_list = Pset.elements all_deps in
-      let targets_as_list  = Pset.elements targets  in
-      let hash =
-        let trace =
-          (List.map all_deps_as_list ~f:(fun fn ->
-             (fn, Utils.Cached_digest.file fn)),
-           targets_as_list,
-           Option.map context ~f:(fun c -> c.name),
-           action)
-        in
-        Digest.string (Marshal.to_string trace [])
+    make_local_parent_dirs t targets ~map_path:(fun x -> x);
+    let all_deps = Pset.union static_deps dyn_deps in
+    let all_deps_as_list = Pset.elements all_deps in
+    let targets_as_list  = Pset.elements targets  in
+    let hash =
+      let trace =
+        (List.map all_deps_as_list ~f:(fun fn ->
+           (fn, Utils.Cached_digest.file fn)),
+         targets_as_list,
+         Option.map context ~f:(fun c -> c.name),
+         action)
       in
-      let sandbox_dir =
-        if sandbox then
-          Some (Path.relative sandbox_dir (Digest.to_hex hash))
-        else
-          None
+      Digest.string (Marshal.to_string trace [])
+    in
+    let sandbox_dir =
+      if sandbox then
+        Some (Path.relative sandbox_dir (Digest.to_hex hash))
+      else
+        None
+    in
+    let deps_or_rule_changed =
+      List.fold_left targets_as_list ~init:false ~f:(fun acc fn ->
+        match Hashtbl.find t.trace fn with
+        | None ->
+          Hashtbl.add t.trace ~key:fn ~data:hash;
+          true
+        | Some prev_hash ->
+          Hashtbl.replace t.trace ~key:fn ~data:hash;
+          acc || prev_hash <> hash)
+    in
+    let targets_missing =
+      List.exists targets_as_list ~f:(fun fn ->
+        match Unix.lstat (Path.to_string fn) with
+        | exception _ -> true
+        | (_ : Unix.stats) -> false)
+    in
+    let force =
+      !Clflags.force &&
+      List.exists targets_as_list ~f:Path.is_alias_stamp_file
+    in
+    if deps_or_rule_changed || targets_missing || force then (
+      (* Do not remove files that are just updated, otherwise this would break
+         incremental compilation *)
+      let targets_to_remove =
+        Pset.diff targets (Action.updated_files action)
       in
-      let deps_or_rule_changed =
-        List.fold_left targets_as_list ~init:false ~f:(fun acc fn ->
-          match Hashtbl.find t.trace fn with
-          | None ->
-            Hashtbl.add t.trace ~key:fn ~data:hash;
-            true
-          | Some prev_hash ->
-            Hashtbl.replace t.trace ~key:fn ~data:hash;
-            acc || prev_hash <> hash)
+      Pset.iter targets_to_remove ~f:Path.unlink_no_err;
+      pending_targets := Pset.union targets_to_remove !pending_targets;
+      let action =
+        match sandbox_dir with
+        | Some sandbox_dir ->
+          Path.rm_rf sandbox_dir;
+          let sandboxed path =
+            if Path.is_local path then
+              Path.append sandbox_dir path
+            else
+              path
+          in
+          make_local_parent_dirs t all_deps ~map_path:sandboxed;
+          make_local_parent_dirs t targets  ~map_path:sandboxed;
+          Action.sandbox action
+            ~sandboxed
+            ~deps:all_deps_as_list
+            ~targets:targets_as_list
+        | None ->
+          action
       in
-      let targets_missing =
-        List.exists targets_as_list ~f:(fun fn ->
-          match Unix.lstat (Path.to_string fn) with
-          | exception _ -> true
-          | (_ : Unix.stats) -> false)
-      in
-      let force =
-        !Clflags.force &&
-        List.exists targets_as_list ~f:Path.is_alias_stamp_file
-      in
-      if deps_or_rule_changed || targets_missing || force then (
-        (* Do not remove files that are just updated, otherwise this would break
-           incremental compilation *)
-        let targets_to_remove =
-          Pset.diff targets (Action.updated_files action)
-        in
-        Pset.iter targets_to_remove ~f:Path.unlink_no_err;
-        pending_targets := Pset.union targets_to_remove !pending_targets;
-        let action =
-          match sandbox_dir with
-          | Some sandbox_dir ->
-            Path.rm_rf sandbox_dir;
-            let sandboxed path =
-              if Path.is_local path then
-                Path.append sandbox_dir path
-              else
-                path
-            in
-            make_local_parent_dirs t all_deps ~map_path:sandboxed;
-            make_local_parent_dirs t targets  ~map_path:sandboxed;
-            Action.sandbox action
-              ~sandboxed
-              ~deps:all_deps_as_list
-              ~targets:targets_as_list
-          | None ->
-            action
-        in
-        make_local_dirs t (Action.chdirs action);
-        with_locks locks ~f:(fun () ->
-          Action.exec ?context ~targets action) >>| fun () ->
-        Option.iter sandbox_dir ~f:Path.rm_rf;
-        (* All went well, these targets are no longer pending *)
-        pending_targets := Pset.diff !pending_targets targets_to_remove;
-        clear_targets_digests_after_rule_execution targets_as_list;
-        match mode with
-        | Standard | Fallback | Not_a_rule_stanza -> ()
-        | Promote | Promote_but_delete_on_clean ->
-          Pset.iter targets ~f:(fun path ->
-            let in_source_tree = Option.value_exn (Path.drop_build_context path) in
-            if mode = Promote_but_delete_on_clean then
-              Promoted_to_delete.add in_source_tree;
-            Io.copy_file
-              ~src:(Path.to_string path)
-              ~dst:(Path.to_string in_source_tree))
-      ) else
-        Fiber.return ())
+      make_local_dirs t (Action.chdirs action);
+      with_locks locks ~f:(fun () ->
+        Action.exec ?context ~targets action) >>| fun () ->
+      Option.iter sandbox_dir ~f:Path.rm_rf;
+      (* All went well, these targets are no longer pending *)
+      pending_targets := Pset.diff !pending_targets targets_to_remove;
+      clear_targets_digests_after_rule_execution targets_as_list;
+      match mode with
+      | Standard | Fallback | Not_a_rule_stanza -> ()
+      | Promote | Promote_but_delete_on_clean ->
+        Pset.iter targets ~f:(fun path ->
+          let in_source_tree = Option.value_exn (Path.drop_build_context path) in
+          if mode = Promote_but_delete_on_clean then
+            Promoted_to_delete.add in_source_tree;
+          Io.copy_file
+            ~src:(Path.to_string path)
+            ~dst:(Path.to_string in_source_tree))
+    ) else
+      Fiber.return ()
   in
   let rule =
     { Internal_rule.
@@ -1106,46 +1002,47 @@ The following targets are not:
 
   targets
 
-and wait_for_file t fn ~targeting =
-  wrap_exceptions t ~targeting ~f:(fun () ->
+and wait_for_file t fn =
+  Fiber.wrap_exn (fun () ->
     match Hashtbl.find t.files fn with
-    | Some file -> wait_for_file_found t fn file ~targeting
+    | Some file -> wait_for_file_found t fn file
     | None ->
       let dir = Path.parent fn in
       if Path.is_in_build_dir dir then begin
         load_dir t ~dir;
         match Hashtbl.find t.files fn with
-        | Some file -> wait_for_file_found t fn file ~targeting
+        | Some file -> wait_for_file_found t fn file
         | None -> no_rule_found t fn
       end else if Path.exists fn then
-        Build_process.return ()
+        Fiber.return ()
       else
         die "File unavailable: %s" (Path.to_string_maybe_quoted fn))
 
-and wait_for_file_found t fn (File_spec.T file) ~targeting =
+and wait_for_file_found t fn (File_spec.T file) =
   match file.rule.exec with
   | Not_started { eval_rule; exec_rule } ->
-    file.rule.exec <- Starting { for_file = targeting };
-    let rule_evaluation = eval_rule ~targeting:fn in
-    let rule_execution = exec_rule rule_evaluation ~targeting:fn in
+    file.rule.exec <- Starting;
+    let rule_evaluation = memoize_for fn eval_rule in
+    let rule_execution  = memoize_for fn (fun () -> exec_rule rule_evaluation) in
     file.rule.exec <-
-      Running { for_file = targeting
-              ; rule_evaluation
+      Running { rule_evaluation
               ; rule_execution
               };
     rule_execution
   | Running { rule_execution; _ } -> rule_execution
-  | Evaluating_rule { for_file; rule_evaluation; exec_rule } ->
-    file.rule.exec <- Starting { for_file = targeting };
-    let rule_execution = exec_rule rule_evaluation ~targeting:fn in
+  | Evaluating_rule { rule_evaluation; exec_rule } ->
+    file.rule.exec <- Starting;
+    let rule_execution = memoize_for fn (fun () -> exec_rule rule_evaluation) in
     file.rule.exec <-
       Running { for_file
               ; rule_evaluation
               ; rule_execution
               };
     rule_execution
-  | Starting _ ->
+  | Starting ->
     (* Recursive deps! *)
+    Dep_path.get >>= fun dep_path ->
+    
     let rec build_loop acc targeting =
       let acc = targeting :: acc in
       if fn = targeting then
@@ -1162,9 +1059,12 @@ and wait_for_file_found t fn (File_spec.T file) ~targeting =
       (String.concat ~sep:"\n--> "
          (List.map loop ~f:Path.to_string))
 
-and wait_for_deps t deps ~targeting =
-  Build_process.all_unit
-    (Pset.fold deps ~init:[] ~f:(fun fn acc -> wait_for_file t fn ~targeting :: acc))
+and wait_for_deps t deps =
+  Fiber.all
+    (Pset.fold deps ~init:[] ~f:(fun fn acc -> wait_for_file t fn :: acc))
+  >>| fun l ->
+  if List.exists l ~f:(function Ok _ -> false | Error () -> true) then
+    raise Already_reported
 
 let stamp_file_for_files_of t ~dir ~ext =
   let files_of_dir =
@@ -1273,12 +1173,12 @@ let eval_request t ~request ~process_target =
   in
 
   let process_targets ts =
-    Build_process.all_unit (List.map (Pset.elements ts) ~f:process_target)
+    Fiber.all_unit (List.map (Pset.elements ts) ~f:process_target)
   in
 
-  Build_process.both
+  Fiber.both
     (process_targets static_deps)
-    (Build_process.all_unit (List.map (Pset.elements rule_deps) ~f:(fun fn ->
+    (Fiber.all_unit (List.map (Pset.elements rule_deps) ~f:(fun fn ->
        wait_for_file t fn ~targeting:fn))
      >>= fun () ->
      let dyn_deps = Build_exec.exec_nop t request () in
@@ -1399,18 +1299,18 @@ let build_rules_internal ?(recursive=false) t ~request =
     (if Path.is_in_build_dir dir then
        wrap_exceptions t ~targeting:fn ~f:(fun () ->
          load_dir t ~dir;
-         Build_process.return ())
+         Fiber.return ())
      else
-       Build_process.return ())
+       Fiber.return ())
     >>= fun () ->
     match Hashtbl.find t.files fn with
     | Some file ->
       file_found fn file
     | None ->
-      Build_process.return ()
+      Fiber.return ()
   and file_found fn (File_spec.T { rule = ir; _ }) =
     if Id_set.mem ir.id !rules_seen then
-      Build_process.return ()
+      Fiber.return ()
     else begin
       rules_seen := Id_set.add ir.id !rules_seen;
       let rule =
@@ -1441,9 +1341,9 @@ let build_rules_internal ?(recursive=false) t ~request =
       rules := rule :: !rules;
       rule >>= fun rule ->
       if recursive then
-        Build_process.all_unit (List.map (Pset.elements rule.deps) ~f:loop)
+        Fiber.all_unit (List.map (Pset.elements rule.deps) ~f:loop)
       else
-        Build_process.return ()
+        Fiber.return ()
     end
   in
   let targets = ref Pset.empty in
@@ -1451,7 +1351,7 @@ let build_rules_internal ?(recursive=false) t ~request =
     targets := Pset.add fn !targets;
     loop fn)
   >>= fun () ->
-  Build_process.all !rules
+  Fiber.all !rules
   >>| fun rules ->
   let rules =
     List.fold_left rules ~init:Pmap.empty ~f:(fun acc (r : Rule.t) ->

@@ -3,87 +3,101 @@ open Import
 type error = exn * Printexc.raw_backtrace
 type 'a or_error = ('a, error) result
 
-module Handler = struct
-  type 'a t =
-    { run         : 'a -> unit
-    ; exn_handler : (error -> unit) option
+let ( += ) r x = r := !r + x
+let ( -= ) r x = r := !r - x
+
+module Var0 = struct
+  module Key = struct
+    type 'a t = ..
+  end
+
+  module type T = struct
+    type t
+    type 'a Key.t += T : t Key.t
+    val id : int
+  end
+
+  type 'a t = (module T with type t = 'a)
+
+  let next = ref 0
+
+  let create (type a) () =
+    let n = !next in
+    next := n + 1;
+    let module M = struct
+      type t = a
+      type 'a Key.t += T : t Key.t
+      let id = n
+    end in
+    (module M : x t)
+end
+
+module Binding = struct
+  type t = T : 'a Var.t * 'a -> t
+end
+
+module Int_map = Map.Make(struct
+    type t = int
+    let compare : int -> int -> int = compare
+  end)
+
+module Execution_context = struct
+  type t =
+    { on_error : exn -> unit
+    ; fibers   : int ref (* number of fibers running in this
+                            execution context *)
+    ; vars     : Binding.t Int_map.t
     }
 
-  let run t x =
-    match t.exn_handler with
-    | None -> t.run x
-    | Some f ->
-      try
-        t.run x
-      with exn ->
-        let bt = Printexc.get_raw_backtrace () in
-        f (exn, bt)
+  let create () =
+    { on_error = reraise
+    ; fibers   = ref 0
+    ; vars     = Int_map.empty
+    }
 end
 
-module Jobs = struct
-  type node =
-    | Many   : 'a * 'a Handler.t Queue.t -> t
-    | Single : 'a * 'a Handler.t -> t
+open Execution_context
 
-  let queue = Queue.create ()
+type 'a t = E.t -> ('a -> unit) -> unit
 
-  let enqueue jobs x =
-    if not (Queue.is_empty jobs) then
-      Queue.enqueue (Node (x, jobs))
+let return x _ k = k x
 
-  let rec run () =
-    while not (Queue.is_empty queue) do
-      match Queue.pop queue with
-      | Single (x, h) ->
-        Handler.run h x
-      | Many (x, q) ->
-        Queue.iter q ~f:(fun h -> Handler.run h x)
-    done
+module O = struct
+  let (>>>) a b ctx k =
+    a ctx (fun () -> b ctx k)
+
+  let (>>=) t f ctx k =
+    t ctx (fun x -> f x ctx k)
+
+  let (>>|) t f ctx k =
+    t ctx (fun x -> k ctx (f x))
 end
 
-module Ivar = struct
-  type 'a state =
-    | Full  of 'a
-    | Empty of ('a -> unit) Queue.t
-
-  type 'a t = { mutable state : 'a state }
-
-  let create () = { state = Empty }
-
-  let fill t x =
-    match t.state with
-    | Full _ -> failwith "Fiber.Ivar.fill"
-    | Empty q ->
-      t.state <- Full x;
-      Jobs.enqueue q x
-
-  let read t ~f ~exn_handler =
-    match ivar.state with
-    | Full x -> k x
-    | Empty q -> Queue.push { Handler.run = k; exn_handler } q
-end
-
-type 'a t =
-  | Return        : 'a -> 'a t
-  | Bind          : 'a t * ('a -> 'b t) -> 'b t
-  | Map           : 'a t * ('a -> 'b) -> 'b t
-  | Both          : 'a t * 'b t -> ('a * 'b) t
-  | All           : 'a t list -> 'a list t
-  | All_unit      : unit t list -> unit t
-  | Read          : 'a Ivar.t -> 'a t
-  | Fill          : 'a Ivar.t * 'a -> unit t
-  | Memoize       : 'a memo_state ref -> 'a t
-  | Handle_errors : (unit -> 'a t) * (error -> unit) -> 'a t
-  | Primitive     : ('a Handler.t -> unit) -> 'a t
-
-and 'a memo_state =
-  | Pending of 'a t
-  | Started of 'a Ivar.t
+open O
 
 type ('a, 'b) both_state =
   | Nothing_yet
   | Got_a of 'a
   | Got_b of 'b
+
+let both a b ctx k =
+  let state = ref Nothing_yet in
+  incr ctx.fibers;
+  begin
+    try
+      a ctx (fun ctx a ->
+        match !state with
+        | Nothing_yet -> decr ctx.fibers; state := Got_a a
+        | Got_a _ -> assert false
+        | Got_b b -> k (a, b))
+    with exn ->
+      ctx.on_error exn
+  end;
+  b ctx (fun ctx b ->
+    match !state with
+    | Nothing_yet -> decr ctx.fibers; state := Got_b b
+    | Got_a a -> k (a, b)
+    | Got_b _ -> assert false)
 
 let list_of_option_array =
   let rec loop arr i acc =
@@ -98,90 +112,170 @@ let list_of_option_array =
   in
   fun a -> loop a (Array.length a) []
 
-let rec eval ~exn_handler ~k = function
-  | Return x ->
-    k x
-  | Bind (t, f) ->
-    eval ~exn_handler t ~k:(fun x -> eval ~exn_handler (f x) ~k)
-  | Map (t, f) ->
-    eval ~exn_handler t ~k:(fun x -> k (f x))
-  | Read ivar -> Ivar.read ivar ~k ~exn_handler
-  | Fill (ivar, x) -> Ivar.fill ivar x
-  | Both (a, b) ->
-    let state = ref Nothing_yet in
-    let k () =
-      match !res_a, !res_b with
-      | Some a, Some b -> k (a, b)
-      | _ -> ()
-    in
-    eval ~exn_handler a ~k:(fun a ->
-      match !state with
-      | Nothing_yet -> state := Got_a a
-      | Got_a _ -> assert false
-      | Got_b b -> k (a, b));
-    eval ~exn_handler b ~k:(fun b ->
-      match !state with
-      | Nothing_yet -> state := Got_b b
-      | Got_a a -> k (a, b)
-      | Got_b _ -> assert false)
-  | All_unit l ->
-    let left_over = ref (List.length l) in
-    let k () =
-      decr !left_over;
-      if !left_over = 0 then k ()
-    in
-    List.iter l ~f:(fun t -> eval ~exn_handler t ~k)
-  | All l ->
+let all l ctx k =
+  match l with
+  | [] -> k []
+  | [t] -> t ctx (fun x -> k [x])
+  | _ ->
     let n = List.length l in
+    ctx.fibers += n - 1;
     let left_over = ref n in
     let results = Array.make n None in
-    List.iteri l ~f:(fun t ->
-      eval ~exn_handler t ~k:(fun x ->
-        results.(i) <- Some x;
-        decr !left_over;
-        if !left_over = 0 then
-          k (list_of_option_array results)))
-  | Memoize memo -> begin
-    match !memo with
-    | Started ivar -> Ivar.read ivar ~k
-    | Pending t ->
-      let ivar = Ivar.create () in
-      state := Started ivar;
-      eval ~exn_handler t ~k:(fun x -> Ivar.fill ivar x)
-  end
-  | Handle_errors (f, exn_handler) -> begin
-      match f () with
-      | exception exn ->
-        let bt = Printexc.raw_backtrace () in
-        exn_handler (exn, bt)
-      | t ->
-        eval t ~exn_handler ~k
-    end
-  | Primitive f -> f { Handler.run; exn_handler }
+    List.iteri l ~f:(fun i t ->
+      try
+        t ctx (fun ctx x ->
+          results.(i) <- Some x;
+          decr !left_over;
+          if !left_over = 0 then
+            k (list_of_option_array results)
+          else
+            decr ctx.fibers)
+      with exn ->
+        ctx.on_error exn)
 
-let return x = Return x
+let all_unit l ctx k =
+  match l with
+  | [] -> k ()
+  | [t] -> t ctx k
+  | _ ->
+    let n = List.length l in
+    ctx.fibers += n - 1;
+    let left_over = ref n in
+    let k ctx () =
+      decr !left_over;
+      if !left_over = 0 then k () else decr ctx.fibers
+    in
+    List.iter l ~f:(fun t ->
+      try
+        t ctx k
+      with exn ->
+        ctx.on_error exn)
 
-module O = struct
-  let ( >>= ) : type a. a t -> (a -> b t) -> b t = fun t f ->
-    match t with
-    | Return x -> f x
-    | _ -> Bind (t, f)
+module Var = struct
+  include Var0
 
-  let ( >>| ) : type a. a t -> (a -> b) -> b t = fun t f ->
-    match t with
-    | Return x -> Return (f x)
-    | _ -> Map (t, f)
+  let get (module M : T with type t = a) ctx k =
+    match Int_map.find M.id ctx.vars with
+    | None -> k None
+    | Some (Binding.T ((module N), v)) ->
+      match N.T with
+      | M.T -> k ctx (Some v)
+      | _   -> assert false
+
+  let get_exn (module M : T with type t = a) ctx k =
+    match Int_map.find M.id ctx.vars with
+    | None -> ctx.on_error (Failure "Fiber.Var.get_exn")
+    | Some (Binding.T ((module N), v)) ->
+      match N.T with
+      | M.T -> k v
+      | _   -> assert false
+
+  let set (var : _ t) x fiber ctx k =
+    let (module M) = var in
+    let data = Binding.T (var, x) in
+    let ctx =
+      { ctx with vars = Int_map.add ctx.vars ~key:M.id ~data }
+    in
+    fiber ctx ()
 end
 
-open O
+let iter_errors f ~on_error ctx k =
+  let fibers = ref 1 in
+  let on_error exn =
+    let n = !fibers - 1 in
+    fibers := n;
+    begin
+      try
+        on_error exn
+      with exn ->
+        ctx.on_error exn
+    end;
+    if n = 0 then k (Error ())
+  in
+  let ctx = { ctx with on_error; fibers } in
+  try
+    t ctx (fun x ->
+      assert (!fibers = 1);
+      fibers := 0;
+      k (Ok x))
+  with exn when !fibers > 0 ->
+    on_error exn
 
-let memoize t = Memoize (ref (Pending t))
+let fold_errors f ~init ~on_error ctx k =
+  let acc = ref init in
+  let on_error exn =
+    acc := f exn !acc
+  in
+  iter_errors f ~on_error ctx (function
+    | Ok _ as ok -> k ok
+    | Error ()   -> k (Error !acc))
 
-let handle_errors g ~f = Handle_errors (g, f)
+let catch_errors f =
+  fold_errors f
+    ~init:[]
+    ~on_error:(fun e l -> e :: l)
 
-type to_fill = To_fill : 'a Ivar.t * 'a -> to_fill
+let sink _ _ = ()
 
-let to_fill = Queue.create ()
+let finalize f ~finally =
+  iter f ~on_error:raise >>= fun res ->
+  finally () >>= fun () ->
+  match res with
+  | Ok x -> return x
+  | Error () -> sink
+
+let wrap_exn f ctx k =
+  f () ctx k
+
+module Handler = struct
+  type 'a t =
+    { run : 'a -> unit
+    ; ctx : E.t
+    }
+
+  let run t x =
+    try
+      t.run x
+    with exn ->
+      t.ctx.on_error exn
+end
+
+module Ivar = struct
+  type 'a state =
+    | Full  of 'a
+    | Empty of 'a Handler.t Queue.t
+
+  type 'a t = { mutable state : 'a state }
+
+  let create () = { state = Empty (Queue.create ()) }
+
+  let fill t x ctx k =
+    match t.state with
+    | Full  _ -> ctx.on_error (Failwith "Fiber.Ivar.fill")
+    | Empty q ->
+      t.state <- Full x;
+      Queue.iter q ~f:(fun handler ->
+        Handler.run handler x)
+
+  let read t ctx k =
+    match t.state with
+    | Full  x -> k x
+    | Empty q -> Queue.push { run = k; ctx } q
+end
+
+let delay f ctx k =
+  f () ctx k
+
+let memoize t =
+  let ivar = Ivar.create () in
+  let started = ref false in
+  delay (fun () ->
+    if !started then
+      Ivar.read ivar
+    else
+      iter_errors ~on_error:raise (fun () -> t) >>| fun res ->
+      Ivar.fill ivar res;
+      res)
 
 module Mutex = struct
   type t =
@@ -189,26 +283,24 @@ module Mutex = struct
     ; mutable waiters : unit Handler.t Queue.t
     }
 
-  let lock t =
-    Primitive (fun handler ->
-      if t.locked then
-
-    )
-else begin
-  t.locked <- true;
-  return ()
-end
+  let lock t ctx k =
+    if t.locked then
+      Queue.push { run = k; ctx } t.waiters
+    else begin
+      t.locked <- true;
+      k ()
+    end
 
   let unlock t =
     assert t.locked;
     if Queue.is_empty t.waiters then
       t.locked <- false
     else
-      Queue.push (To_fill (Queue.pop t.waiters, ())) to_fill
+      Handler.run (Queue.pop t.waiters) ()
 
   let with_lock t f =
     lock t >>= fun () ->
-    finalize f ~finally:(fun () -> unlock t)
+    finalize f ~finally:(fun () -> unlock t; return ())
 
   let create () =
     { locked  = false
@@ -236,11 +328,11 @@ let accepted_codes : type a b. (a, b) failure_mode -> accepted_codes = function
 
 let map_result
   : type a b. (a, b) failure_mode -> int t -> f:(unit -> a) -> b t
-  = fun mode future ~f ->
+  = fun mode t ~f ->
     match mode with
-    | Strict   -> future >>| fun _ -> f ()
+    | Strict   -> t >>| fun _ -> f ()
     | Accept _ ->
-      future >>| function
+      t >>| function
       | 0 -> Ok (f ())
       | n -> Error n
 
@@ -271,30 +363,31 @@ type job =
   ; stdout_to : std_output_to
   ; stderr_to : std_output_to
   ; env       : string array option
-  ; ivar      : int Ivar.t
+  ; handler   : int Handler.t
   ; ok_codes  : accepted_codes
   ; purpose   : purpose
   }
 
 let to_run : job Queue.t = Queue.create ()
 
-let run_internal ?dir ?(stdout_to=Terminal) ?(stderr_to=Terminal) ?env ~purpose fail_mode prog args =
+let run_internal ?dir ?(stdout_to=Terminal) ?(stderr_to=Terminal) ?env ~purpose fail_mode prog args ctx k =
   let dir =
     match dir with
     | Some "." -> None
     | _ -> dir
   in
-  create (fun ivar ->
-    Queue.push { prog
-               ; args
-               ; dir
-               ; stdout_to
-               ; stderr_to
-               ; env
-               ; ivar
-               ; ok_codes = accepted_codes fail_mode
-               ; purpose
-               } to_run)
+  Queue.push
+    { prog
+    ; args
+    ; dir
+    ; stdout_to
+    ; stderr_to
+    ; env
+    ; handler = { run = k; ctx }
+    ; ok_codes = accepted_codes fail_mode
+    ; purpose
+    }
+    to_run
 
 let run ?dir ?stdout_to ?stderr_to ?env ?(purpose=Internal_job) fail_mode prog args =
   map_result fail_mode (run_internal ?dir ?stdout_to ?stderr_to ?env ~purpose fail_mode prog args)
@@ -541,7 +634,7 @@ module Scheduler = struct
     let all () = Hashtbl.fold all ~init:[] ~f:(fun ~key:_ ~data:job acc -> job :: acc)
   end
 
-  let process_done ?(exiting=false) job (status : Unix.process_status) =
+  let process_done job (status : Unix.process_status) =
     let output =
       match job.output_filename with
       | None -> ""
@@ -568,12 +661,12 @@ module Scheduler = struct
           Format.eprintf
             "@{<warning>Warning@}: Command [@{<id>%d@}] exited with code %d, \
              but I'm ignore it, hope that's OK.\n%!" job.id n;
-      end else if not exiting && (output <> "" || job.job.purpose <> Internal_job) then
+      end else if (output <> "" || job.job.purpose <> Internal_job) then
         begin
           Format.eprintf "@{<ok>%12s@} %a@." progname pp_purpose job.job.purpose;
           Format.eprintf "%s%!" output;
         end;
-      if not exiting then Ivar.fill job.job.ivar n
+      Handler.run job.job.handler n
     | WEXITED n ->
       if !Clflags.verbose then begin
         Format.eprintf "\n@{<kwd>Command@} [@{<id>%d@}] exited with code %d:\n\
@@ -588,7 +681,7 @@ module Scheduler = struct
           (Ansi_color.strip job.command_line);
         Format.eprintf "%s%!" output;
       end;
-      if not exiting then die ""
+      job.job.on_error (Fatal_error "")
     | WSIGNALED n ->
       if !Clflags.verbose then begin
         Format.eprintf "\n@{<kwd>Command@} [@{<id>%d@}] got signal %s:\n\
@@ -603,57 +696,14 @@ module Scheduler = struct
           (Ansi_color.strip job.command_line);
         Format.eprintf "%s%!" output;
       end;
-      if not exiting then die ""
+      job.job.on_error (Fatal_error "")
     | WSTOPPED _ -> assert false
 
   let gen_id =
     let next = ref (-1) in
     fun () -> incr next; !next
 
-  let at_exit_handlers = Queue.create ()
-  let at_exit_after_waiting_for_commands f = Queue.push f at_exit_handlers
-  let exec_at_exit_handlers () =
-    while not (Queue.is_empty at_exit_handlers) do
-      Queue.pop at_exit_handlers ()
-    done
-
-  let wait_for_unfinished_jobs () =
-    let rec loop n =
-      if Running_jobs.count () > 0 && n > 0 then
-        match Running_jobs.wait_nonblocking () with
-        | None ->
-          ignore (Unix.select [] [] [] 0.05 : _ * _ * _);
-          loop (n - 1)
-        | Some (job, status) ->
-          process_done job status ~exiting:true;
-          loop n
-    in
-    loop 10;
-    if Running_jobs.count () > 0 then begin
-      if !Clflags.verbose then begin
-        let pp_job ppf job =
-          let _, name, _ = split_prog job.job.prog in
-          Format.fprintf ppf "%s [@{<id>%d@}]" name job.id
-        in
-        Format.eprintf "\nWaiting for the following jobs to finish: %a@."
-          (Format.pp_print_list ~pp_sep:(fun ppf () -> Format.fprintf ppf ", ") pp_job)
-          (Running_jobs.all ());
-      end else begin
-        let n = Running_jobs.count () in
-        Format.eprintf "\nWaiting for %d %s to finish.@."
-          n
-          (if n = 1 then "job" else "jobs")
-      end;
-      while Running_jobs.count () > 0 do
-        let job, status = Running_jobs.wait () in
-        process_done job status ~exiting:true
-      done
-    end
-
-  let () =
-    at_exit (fun () ->
-      wait_for_unfinished_jobs ();
-      exec_at_exit_handlers ())
+  let at_exit_after_waiting_for_commands = at_exit
 
   let get_std_output ~default = function
     | Terminal -> (default, None)
@@ -673,10 +723,10 @@ module Scheduler = struct
     | Some (Fd      fd) -> Unix.close fd
     | Some (Channel oc) -> close_out  oc
 
-  let rec go_rec cwd log t =
-    match (repr t).state with
-    | Return v -> v
-    | _ ->
+  let iter cwd log result =
+    match !result with
+    | Some x -> x
+    | None ->
       while Running_jobs.count () < !Clflags.concurrency &&
             not (Queue.is_empty to_run) do
         let job = Queue.pop to_run in
@@ -722,11 +772,7 @@ module Scheduler = struct
       done;
       let job, status = Running_jobs.wait () in
       process_done job status;
-      while not (Queue.is_empty to_fill) do
-        let (To_fill (ivar, x)) = Queue.pop to_fill in
-        Ivar.fill ivar x
-      done;
-      go_rec cwd log t
+      go_rec cwd log result
 
   let go ?(log=Log.no_log) t =
     Lazy.force Ansi_color.setup_env_for_colors;
@@ -734,5 +780,13 @@ module Scheduler = struct
     let cwd = Sys.getcwd () in
     if cwd <> initial_cwd then
       Printf.eprintf "Entering directory '%s'\n%!" cwd;
-    go_rec cwd log t
+    let t =
+      iter_errors t ~on_error:(fun exn ->
+        Format.eprintf "%a@?" Report_error.report exn)
+    in
+    let result = ref None in
+    t (Execution_context.create ()) (fun x -> result := Some x);
+    match go_rec cwd log !result with
+    | Ok x -> x
+    | Error l -> die ""
 end
