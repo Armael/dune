@@ -287,7 +287,7 @@ let memoize t =
     | None ->
       let ivar = Ivar.create () in
       cell := Some ivar;
-      iter_errors ~on_error:raise (fun () -> t) >>= fun res ->
+      iter_errors ~on_error:reraise (fun () -> t) >>= fun res ->
       Ivar.fill ivar res >>| fun () ->
       match res with
       | Ok x -> x
