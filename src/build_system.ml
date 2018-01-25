@@ -777,12 +777,15 @@ and load_dir_and_get_targets t ~dir =
     try
       load_dir_step2_exn t ~dir ~collector ~lazy_generators
     with exn ->
+      (match Hashtbl.find t.dirs dir with
+       | Some (Loaded _) -> ()
+       | _ ->
+         (match t.load_dir_stack with
+          | [] -> assert false
+          | x :: l ->
+            t.load_dir_stack <- l;
+            assert (x = dir)));
       Hashtbl.replace t.dirs ~key:dir ~data:Failed_to_load;
-      (match t.load_dir_stack with
-       | [] -> assert false
-       | x :: l ->
-         t.load_dir_stack <- l;
-         assert (x = dir));
       reraise exn
 
 and load_dir_step2_exn t ~dir ~collector ~lazy_generators =

@@ -67,6 +67,9 @@ type 'a t = Execution_context.t -> ('a -> unit) -> unit
 
 let return x _ k = k x
 
+let delay f ctx k =
+  f () ctx k
+
 module O = struct
   let (>>>) a b ctx k =
     a ctx (fun () -> b ctx k)
@@ -270,9 +273,6 @@ module Ivar = struct
     | Full  x -> k x
     | Empty q -> Queue.push { Handler. run = k; ctx } q
 end
-
-let delay f ctx k =
-  f () ctx k
 
 exception Already_reported
 
@@ -789,4 +789,9 @@ module Scheduler = struct
     match go_rec cwd log result with
     | Ok x -> x
     | Error _ -> die ""
+end
+
+module List = struct
+  let map l ~f =
+    all (List.map l ~f:(fun x -> delay (fun () -> f x)))
 end

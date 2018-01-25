@@ -41,6 +41,10 @@ val both : 'a t -> 'b t -> ('a * 'b) t
 val all : 'a t list -> 'a list t
 val all_unit : unit t list -> unit t
 
+module List : sig
+  val map : 'a list -> f:('a -> 'b t) -> 'b list t
+end
+
 (** {1 Local storage} *)
 
 (** Variables local to a fiber *)
