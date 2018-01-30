@@ -192,7 +192,7 @@ module Var = struct
 
   let get_exn var ctx k =
     match Int_map.find (id var) ctx.vars with
-    | None -> ctx.on_error (Failure "Fiber.Var.get_exn")
+    | None -> failwith "Fiber.Var.get_exn"
     | Some (Binding.T (var', v)) ->
       let eq = eq var' var in
       k (cast eq v)
@@ -211,6 +211,7 @@ let iter_errors_internal f ~on_error ctx k =
   let on_error exn =
     let n = !fibers - 1 in
     fibers := n;
+    assert (n > 0);
     begin
       match on_error with
       | None ->
