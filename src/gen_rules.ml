@@ -1128,14 +1128,14 @@ let gen ~contexts ~build_system
   List.iter contexts ~f:(fun c ->
     Hashtbl.add sctxs ~key:c.Context.name ~data:(Fiber.Ivar.create ()));
   let make_sctx (context : Context.t) : _ Fiber.t =
-    let host =
+    let host () =
       match context.for_host with
       | None -> Fiber.return None
       | Some h ->
         Fiber.Ivar.read (Option.value_exn (Hashtbl.find sctxs h.name))
         >>| fun x -> Some x
     in
-    let stanzas =
+    let stanzas () =
       Jbuild_load.Jbuilds.eval ~context jbuilds >>| fun stanzas ->
       match only_packages with
       | None -> stanzas
@@ -1151,7 +1151,7 @@ let gen ~contexts ~build_system
                String_set.mem package.name pkgs
              | _ -> true)))
     in
-    Fiber.both host stanzas >>= fun (host, stanzas) ->
+    Fiber.fork host stanzas >>= fun (host, stanzas) ->
     let sctx =
       Super_context.create
         ?host
@@ -1168,7 +1168,7 @@ let gen ~contexts ~build_system
     >>| fun () ->
     (context.name, ((module M : Gen), stanzas))
   in
-  Fiber.List.map contexts ~f:make_sctx >>| fun l ->
+  Fiber.nfork_map contexts ~f:make_sctx >>| fun l ->
   let map = String_map.of_alist_exn l in
   Build_system.set_rule_generators build_system
     (String_map.map map ~f:(fun ((module M : Gen), _) -> M.gen_rules));

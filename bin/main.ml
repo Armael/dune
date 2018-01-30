@@ -854,25 +854,23 @@ let install_uninstall ~what =
        let install_files_by_context =
          CMap.of_alist_multi install_files |> CMap.bindings
        in
-       Fiber.all_unit
-         (List.map install_files_by_context ~f:(fun (context, install_files) ->
-            get_prefix context ~from_command_line:prefix_from_command_line
-            >>= fun prefix ->
-            get_libdir context ~libdir_from_command_line
-            >>= fun libdir ->
-            Fiber.all_unit
-              (List.map install_files ~f:(fun path ->
-                 let purpose = Fiber.Build_job install_files in
-                 Fiber.run ~purpose Strict (Path.to_string opam_installer)
-                   ([ sprintf "-%c" what.[0]
-                    ; Path.to_string path
-                    ; "--prefix"
-                    ; Path.to_string prefix
-                    ] @
-                    match libdir with
-                    | None -> []
-                    | Some p -> [ "--libdir"; Path.to_string p ]
-                   ))))))
+       Fiber.nfork_iter install_files_by_context ~f:(fun (context, install_files) ->
+         get_prefix context ~from_command_line:prefix_from_command_line
+         >>= fun prefix ->
+         get_libdir context ~libdir_from_command_line
+         >>= fun libdir ->
+         Fiber.nfork_iter install_files ~f:(fun path ->
+           let purpose = Fiber.Build_job install_files in
+           Fiber.run ~purpose Strict (Path.to_string opam_installer)
+             ([ sprintf "-%c" what.[0]
+              ; Path.to_string path
+              ; "--prefix"
+              ; Path.to_string prefix
+              ] @
+              match libdir with
+              | None -> []
+              | Some p -> [ "--libdir"; Path.to_string p ]
+             ))))
   in
   ( Term.(const go
           $ common

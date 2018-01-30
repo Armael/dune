@@ -251,7 +251,7 @@ let create ~(kind : Kind.t) ~path ~base_env ~env_extra ~name ~merlin
 
     let build_dir = Path.of_string (sprintf "_build/%s" name) in
     let ocamlc_config_cmd = sprintf "%s -config" (Path.to_string ocamlc) in
-    let findlib_path =
+    let findlib_path () =
       if use_findlib then
         (* If ocamlfind is present, it has precedence over everything else. *)
         match which "ocamlfind" with
@@ -277,9 +277,10 @@ let create ~(kind : Kind.t) ~path ~base_env ~env_extra ~name ~merlin
       else
         Fiber.return []
     in
-    Fiber.both
+    Fiber.fork
       findlib_path
-      (Fiber.run_capture_lines ~env Strict (Path.to_string ocamlc) ["-config"])
+      (fun () ->
+         Fiber.run_capture_lines ~env Strict (Path.to_string ocamlc) ["-config"])
     >>= fun (findlib_path, ocamlc_config) ->
 
     let ocamlc_config =
@@ -438,16 +439,15 @@ let create ~(kind : Kind.t) ~path ~base_env ~env_extra ~name ~merlin
 
   let implicit = not (List.mem ~set:targets Workspace.Context.Target.Native) in
   create_one () ~implicit ~name ~merlin >>= fun native ->
-  Fiber.all (
-    List.filter_map targets ~f:(function
-      | Native -> None
-      | Named findlib_toolchain ->
-        let name = sprintf "%s.%s" name findlib_toolchain in
-        Some (create_one () ~implicit:false ~name ~findlib_toolchain ~host:native
-                ~merlin:false)
-    )
-  ) >>| fun others ->
-  native :: others
+  Fiber.nfork_map targets ~f:(function
+    | Native -> Fiber.return None
+    | Named findlib_toolchain ->
+      let name = sprintf "%s.%s" name findlib_toolchain in
+      create_one () ~implicit:false ~name ~findlib_toolchain ~host:native
+        ~merlin:false
+      >>| fun x -> Some x)
+  >>| fun others ->
+  native :: List.filter_map others ~f:(fun x -> x)
 
 let opam_config_var t var = opam_config_var ~env:t.env ~cache:t.opam_var_cache var
 

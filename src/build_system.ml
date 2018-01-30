@@ -622,13 +622,15 @@ let rec compile_rule t ?(copy_source=false) pre_rule =
     Build_exec.exec t build ()
   in
   let exec_rule rule_evaluation =
-    Fiber.both
-      (wait_for_deps t static_deps)
-      (rule_evaluation >>= fun (action, dyn_deps) ->
-       wait_for_deps t (Pset.diff dyn_deps static_deps)
-       >>| fun () ->
-       (action, dyn_deps))
-    >>= fun ((), (action, dyn_deps)) ->
+    Fiber.fork_unit
+      (fun () ->
+         wait_for_deps t static_deps)
+      (fun () ->
+         rule_evaluation >>= fun (action, dyn_deps) ->
+         wait_for_deps t (Pset.diff dyn_deps static_deps)
+         >>| fun () ->
+         (action, dyn_deps))
+    >>= fun (action, dyn_deps) ->
     make_local_parent_dirs t targets ~map_path:(fun x -> x);
     let all_deps = Pset.union static_deps dyn_deps in
     let all_deps_as_list = Pset.elements all_deps in
@@ -965,20 +967,19 @@ The following targets are not:
   targets
 
 and wait_for_file t fn =
-  Fiber.wrap_exn (fun () ->
-    match Hashtbl.find t.files fn with
-    | Some file -> wait_for_file_found fn file
-    | None ->
-      let dir = Path.parent fn in
-      if Path.is_in_build_dir dir then begin
-        load_dir t ~dir;
-        match Hashtbl.find t.files fn with
-        | Some file -> wait_for_file_found fn file
-        | None -> no_rule_found t fn
-      end else if Path.exists fn then
-        Fiber.return ()
-      else
-        die "File unavailable: %s" (Path.to_string_maybe_quoted fn))
+  match Hashtbl.find t.files fn with
+  | Some file -> wait_for_file_found fn file
+  | None ->
+    let dir = Path.parent fn in
+    if Path.is_in_build_dir dir then begin
+      load_dir t ~dir;
+      match Hashtbl.find t.files fn with
+      | Some file -> wait_for_file_found fn file
+      | None -> no_rule_found t fn
+    end else if Path.exists fn then
+      Fiber.return ()
+    else
+      die "File unavailable: %s" (Path.to_string_maybe_quoted fn)
 
 and wait_for_file_found fn (File_spec.T file) =
   match file.rule.exec with
@@ -1019,8 +1020,7 @@ and wait_for_file_found fn (File_spec.T file) =
          (List.map loop ~f:Path.to_string))
 
 and wait_for_deps t deps =
-  Fiber.all_unit
-    (Pset.fold deps ~init:[] ~f:(fun fn acc -> wait_for_file t fn :: acc))
+  Fiber.nfork_iter (Pset.elements deps) ~f:(wait_for_file t)
 
 let stamp_file_for_files_of t ~dir ~ext =
   let files_of_dir =
@@ -1129,15 +1129,16 @@ let eval_request t ~request ~process_target =
   in
 
   let process_targets ts =
-    Fiber.all_unit (List.map (Pset.elements ts) ~f:process_target)
+    Fiber.nfork_iter (Pset.elements ts) ~f:process_target
   in
 
-  Fiber.both
-    (process_targets static_deps)
-    (wait_for_deps t rule_deps
-     >>= fun () ->
-     let dyn_deps = Build_exec.exec_nop t request () in
-     process_targets (Pset.diff dyn_deps static_deps))
+  Fiber.fork
+    (fun () -> process_targets static_deps)
+    (fun () ->
+       wait_for_deps t rule_deps
+       >>= fun () ->
+       let dyn_deps = Build_exec.exec_nop t request () in
+       process_targets (Pset.diff dyn_deps static_deps))
   >>| fun ((), ()) -> ()
 
 let do_build t ~request =
@@ -1285,10 +1286,11 @@ let build_rules_internal ?(recursive=false) t ~request =
                             };
           make_rule rule_evaluation
       in
+      let rule = Fiber.memoize rule in
       rules := rule :: !rules;
       rule >>= fun rule ->
       if recursive then
-        Fiber.all_unit (List.map (Pset.elements rule.deps) ~f:loop)
+        Fiber.nfork_iter (Pset.elements rule.deps) ~f:loop
       else
         Fiber.return ()
     end
@@ -1298,7 +1300,7 @@ let build_rules_internal ?(recursive=false) t ~request =
     targets := Pset.add fn !targets;
     loop fn)
   >>= fun () ->
-  Fiber.all !rules
+  Fiber.nfork_map !rules ~f:(fun x -> x)
   >>| fun rules ->
   let rules =
     List.fold_left rules ~init:Pmap.empty ~f:(fun acc (r : Rule.t) ->

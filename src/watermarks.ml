@@ -205,11 +205,15 @@ let subst_git ?name () =
     | Some x -> Path.to_string x
     | None -> Utils.program_not_found "git"
   in
-  Fiber.both
-    (Fiber.both
-       (Fiber.run_capture Strict git ["describe"; "--always"; "--dirty"])
-       (Fiber.run_capture Strict git ["rev-parse"; rev]))
-    (Fiber.run_capture_lines Strict git ["ls-tree"; "-r"; "--name-only"; rev])
+  Fiber.fork
+    (fun () ->
+       Fiber.fork
+         (fun () ->
+            Fiber.run_capture Strict git ["describe"; "--always"; "--dirty"])
+         (fun () ->
+            Fiber.run_capture Strict git ["rev-parse"; rev]))
+    (fun () ->
+       Fiber.run_capture_lines Strict git ["ls-tree"; "-r"; "--name-only"; rev])
   >>= fun ((version, commit), files) ->
   let version = String.trim version in
   let commit  = String.trim commit  in

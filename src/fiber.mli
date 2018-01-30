@@ -35,15 +35,17 @@ val memoize : 'a t -> 'a t
 
 (** The following functions allow to combine two or more fibers. Note
     that when the execution of a fiber fails because of an exception,
-    the other fibers will continue to run. *)
+    the other fibers will continue to run.
 
-val both : 'a t -> 'b t -> ('a * 'b) t
-val all : 'a t list -> 'a list t
-val all_unit : unit t list -> unit t
+    This is why combining functions always take [unit -> _ t] functions rather than [_ t]
+    values directly.
+*)
 
-module List : sig
-  val map : 'a list -> f:('a -> 'b t) -> 'b list t
-end
+val fork : (unit -> 'a t) -> (unit -> 'b t) -> ('a * 'b) t
+val fork_unit : (unit -> unit t) -> (unit -> 'a t) -> 'a t
+
+val nfork_map  : 'a list -> f:('a -> 'b   t) -> 'b list t
+val nfork_iter : 'a list -> f:('a -> unit t) -> unit    t
 
 (** {1 Local storage} *)
 
@@ -114,10 +116,6 @@ val catch_errors
 val finalize
   :  (unit -> 'a t)
   -> finally:(unit -> unit t)
-  -> 'a t
-
-val wrap_exn
-  :  (unit -> 'a t)
   -> 'a t
 
 (** {1 Synchronization} *)

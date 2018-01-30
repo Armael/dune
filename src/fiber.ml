@@ -88,12 +88,12 @@ type ('a, 'b) both_state =
   | Got_a of 'a
   | Got_b of 'b
 
-let both a b ctx k =
+let fork fa fb ctx k =
   let state = ref Nothing_yet in
   incr ctx.fibers;
   begin
     try
-      a ctx (fun a ->
+      fa () ctx (fun a ->
         match !state with
         | Nothing_yet -> decr ctx.fibers; state := Got_a a
         | Got_a _ -> assert false
@@ -101,10 +101,29 @@ let both a b ctx k =
     with exn ->
       ctx.on_error exn
   end;
-  b ctx (fun b ->
+  fb () ctx (fun b ->
     match !state with
     | Nothing_yet -> decr ctx.fibers; state := Got_b b
     | Got_a a -> k (a, b)
+    | Got_b _ -> assert false)
+
+let fork_unit fa fb ctx k =
+  let state = ref Nothing_yet in
+  incr ctx.fibers;
+  begin
+    try
+      fa () ctx (fun () ->
+        match !state with
+        | Nothing_yet -> decr ctx.fibers; state := Got_a ()
+        | Got_a _ -> assert false
+        | Got_b b -> k b)
+    with exn ->
+      ctx.on_error exn
+  end;
+  fb () ctx (fun b ->
+    match !state with
+    | Nothing_yet -> decr ctx.fibers; state := Got_b b
+    | Got_a () -> k b
     | Got_b _ -> assert false)
 
 let list_of_option_array =
@@ -120,19 +139,19 @@ let list_of_option_array =
   in
   fun a -> loop a (Array.length a) []
 
-let all l ctx k =
+let nfork_map l ~f ctx k =
   match l with
   | [] -> k []
-  | [t] -> t ctx (fun x -> k [x])
+  | [x] -> f x ctx (fun x -> k [x])
   | _ ->
     let n = List.length l in
     ctx.fibers += (n - 1);
     let left_over = ref n in
     let results = Array.make n None in
-    List.iteri l ~f:(fun i t ->
+    List.iteri l ~f:(fun i x ->
       try
-        t ctx (fun x ->
-          results.(i) <- Some x;
+        f x ctx (fun y ->
+          results.(i) <- Some y;
           decr left_over;
           if !left_over = 0 then
             k (list_of_option_array results)
@@ -141,10 +160,10 @@ let all l ctx k =
       with exn ->
         ctx.on_error exn)
 
-let all_unit l ctx k =
+let nfork_iter l ~f ctx k =
   match l with
   | [] -> k ()
-  | [t] -> t ctx k
+  | [x] -> f x ctx k
   | _ ->
     let n = List.length l in
     ctx.fibers += (n - 1);
@@ -153,9 +172,9 @@ let all_unit l ctx k =
       decr left_over;
       if !left_over = 0 then k () else decr ctx.fibers
     in
-    List.iter l ~f:(fun t ->
+    List.iter l ~f:(fun x ->
       try
-        t ctx k
+        f x ctx k
       with exn ->
         ctx.on_error exn)
 
@@ -231,9 +250,6 @@ let finalize f ~finally =
   match res with
   | Ok x -> return x
   | Error () -> sink
-
-let wrap_exn f ctx k =
-  f () ctx k
 
 module Handler = struct
   type 'a t =
@@ -789,9 +805,4 @@ module Scheduler = struct
     match go_rec cwd log result with
     | Ok x -> x
     | Error _ -> die ""
-end
-
-module List = struct
-  let map l ~f =
-    all (List.map l ~f:(fun x -> delay (fun () -> f x)))
 end
