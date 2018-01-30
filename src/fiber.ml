@@ -215,6 +215,7 @@ let iter_errors f ~on_error ctx k =
       try
         on_error exn
       with exn ->
+        incr ctx.fibers;
         ctx.on_error exn
     end;
     if n = 0 then k (Error ())
