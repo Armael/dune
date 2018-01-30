@@ -206,17 +206,22 @@ module Var = struct
     fiber ctx k
 end
 
-let iter_errors f ~on_error ctx k =
+let iter_errors_internal f ~on_error ctx k =
   let fibers = ref 1 in
   let on_error exn =
     let n = !fibers - 1 in
     fibers := n;
     begin
-      try
-        on_error exn
-      with exn ->
+      match on_error with
+      | None ->
         incr ctx.fibers;
         ctx.on_error exn
+      | Some f ->
+        try
+          f exn
+        with exn ->
+          incr ctx.fibers;
+          ctx.on_error exn
     end;
     if n = 0 then k (Error ())
   in
@@ -228,6 +233,9 @@ let iter_errors f ~on_error ctx k =
       k (Ok x))
   with exn when !fibers > 0 ->
     on_error exn
+
+let wait_errors f = iter_errors_internal f ~on_error:None
+let iter_errors f ~on_error = iter_errors_internal f ~on_error:(Some on_error)
 
 let fold_errors f ~init ~on_error ctx k =
   let acc = ref init in
@@ -246,7 +254,7 @@ let catch_errors f =
 let sink _ _ = ()
 
 let finalize f ~finally =
-  iter_errors f ~on_error:reraise >>= fun res ->
+  wait_errors f >>= fun res ->
   finally () >>= fun () ->
   match res with
   | Ok x -> return x
@@ -304,7 +312,7 @@ let memoize t =
     | None ->
       let ivar = Ivar.create () in
       cell := Some ivar;
-      iter_errors ~on_error:reraise (fun () -> t) >>= fun res ->
+      wait_errors (fun () -> t) >>= fun res ->
       Ivar.fill ivar res >>| fun () ->
       match res with
       | Ok x -> x

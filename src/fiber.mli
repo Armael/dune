@@ -79,8 +79,11 @@ end with type 'a fiber := 'a t
 
 (** [fold_errors f ~init ~on_error] calls [on_error] for every
     exception raised during the execution of [f]. This include
-    exception raised when calling [f ()] or during the execution of
-    fibers after [f ()] has returned. *)
+    exceptions raised when calling [f ()] or during the execution of
+    fibers after [f ()] has returned.
+
+    Exceptions raised by [on_error] are passed on to the parent
+    error handler. *)
 val fold_errors
   :  (unit -> 'a t)
   -> init:'b
@@ -92,11 +95,16 @@ val fold_errors
     {[
       fold_errors f ~init:() ~on_error:(fun e () ->
         on_error e)
-      ]}
+    ]}
 *)
 val iter_errors
   :  (unit -> 'a t)
   -> on_error:(exn -> unit)
+  -> ('a, unit) result t
+
+(** Same as [iter_error f ~on_error:reraise]. *)
+val wait_errors
+  :  (unit -> 'a t)
   -> ('a, unit) result t
 
 (** [catch_errors f] is:
