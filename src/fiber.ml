@@ -399,43 +399,6 @@ type purpose =
   | Internal_job
   | Build_job of Path.t list
 
-type job =
-  { prog      : string
-  ; args      : string list
-  ; dir       : string option
-  ; stdout_to : std_output_to
-  ; stderr_to : std_output_to
-  ; env       : string array option
-  ; handler   : int Handler.t
-  ; ok_codes  : accepted_codes
-  ; purpose   : purpose
-  }
-
-let to_run : job Queue.t = Queue.create ()
-
-let run_internal ?dir ?(stdout_to=Terminal) ?(stderr_to=Terminal) ?env ~purpose fail_mode prog args ctx k =
-  let dir =
-    match dir with
-    | Some "." -> None
-    | _ -> dir
-  in
-  Queue.push
-    { prog
-    ; args
-    ; dir
-    ; stdout_to
-    ; stderr_to
-    ; env
-    ; handler = { run = k; ctx }
-    ; ok_codes = accepted_codes fail_mode
-    ; purpose
-    }
-    to_run
-
-let run ?dir ?stdout_to ?stderr_to ?env ?(purpose=Internal_job) fail_mode prog args =
-  map_result fail_mode (run_internal ?dir ?stdout_to ?stderr_to ?env ~purpose fail_mode prog args)
-    ~f:ignore
-
 module Temp = struct
   let tmp_files = ref String_set.empty
   let () =
@@ -455,36 +418,127 @@ module Temp = struct
     tmp_files := String_set.remove fn !tmp_files
 end
 
-let run_capture_gen ?dir ?env ?(purpose=Internal_job) fail_mode prog args ~f =
-  let fn = Temp.create "jbuild" ".output" in
-  map_result fail_mode (run_internal ?dir ~stdout_to:(File fn) ?env ~purpose fail_mode prog args)
-    ~f:(fun () ->
-      let x = f fn in
-      Temp.destroy fn;
-      x)
-
-let run_capture       = run_capture_gen ~f:Io.read_file
-let run_capture_lines = run_capture_gen ~f:Io.lines_of_file
-
-let run_capture_line ?dir ?env ?(purpose=Internal_job) fail_mode prog args =
-  run_capture_gen ?dir ?env ~purpose fail_mode prog args ~f:(fun fn ->
-    match Io.lines_of_file fn with
-    | [x] -> x
-    | l ->
-      let cmdline =
-        let s = String.concat (prog :: args) ~sep:" " in
-        match dir with
-        | None -> s
-        | Some dir -> sprintf "cd %s && %s" dir s
-      in
-      match l with
-      | [] ->
-        die "command returned nothing: %s" cmdline
-      | _ ->
-        die "command returned too many lines: %s\n%s"
-          cmdline (String.concat l ~sep:"\n"))
-
 module Scheduler = struct
+  type running_job =
+    { pid             : int
+    ; command_line    : string
+    ; output_filename : string option
+    ; handler         : (string * Unix.process_status) Handler.t
+    }
+
+  module Running_jobs : sig
+    val add : running_job -> unit
+    val wait : unit -> running_job * Unix.process_status
+    val count : unit -> int
+  end = struct
+    let all = Hashtbl.create 128
+
+    let add job = Hashtbl.add all ~key:job.pid ~data:job
+
+    let count () = Hashtbl.length all
+
+    let resolve_and_remove_job pid =
+      let job =
+        Hashtbl.find_exn all pid ~string_of_key:(sprintf "<pid:%d>")
+          ~table_desc:(fun _ -> "<running-jobs>")
+      in
+      Hashtbl.remove all pid;
+      job
+
+    exception Finished of running_job * Unix.process_status
+
+    let wait_nonblocking_win32 () =
+      match
+        Hashtbl.iter all ~f:(fun ~key:pid ~data:job ->
+          let pid, status = Unix.waitpid [WNOHANG] pid in
+          if pid <> 0 then
+            raise_notrace (Finished (job, status)))
+      with
+      | () -> None
+      | exception (Finished (job, status)) ->
+        Hashtbl.remove all job.pid;
+        Some (job, status)
+
+    let rec wait_win32 () =
+      match wait_nonblocking_win32 () with
+      | None ->
+        ignore (Unix.select [] [] [] 0.001);
+        wait_win32 ()
+      | Some x -> x
+
+    let wait_unix () =
+      let pid, status = Unix.wait () in
+      (resolve_and_remove_job pid, status)
+
+    let wait =
+      if Sys.win32 then
+        wait_win32
+      else
+        wait_unix
+  end
+
+  let waiting_for_slot = Queue.create ()
+  let wait_for_slot ctx k =
+    if Running_jobs.count () < !Clflags.concurrency then
+      k ()
+    else
+      Queue.push { Handler. ctx; run = k } waiting_for_slot
+
+  let wait_for_process ~pid ~command_line ~output_filename ctx k =
+    Running_jobs.add
+      { pid
+      ; command_line
+      ; output_filename
+      ; handler = { Handler. ctx; run = k }
+      }
+
+  let rec go_rec log result =
+    match !result with
+    | Some x -> x
+    | None ->
+      let job, status = Running_jobs.wait () in
+      if not (Queue.is_empty waiting_for_slot) then Handler.run (Queue.pop waiting_for_slot) ();
+      let output =
+        match job.output_filename with
+        | None -> ""
+        | Some fn ->
+          let s = Io.read_file fn in
+          Temp.destroy fn;
+          let len = String.length s in
+          if len > 0 && s.[len - 1] <> '\n' then
+            s ^ "\n"
+          else
+            s
+      in
+      Log.command log
+        ~command_line:job.command_line
+        ~output:output
+        ~exit_status:status;
+      Handler.run job.handler (output, status);
+      go_rec log result
+
+  let cwd = ref ""
+
+  let go ?(log=Log.no_log) t =
+    Lazy.force Ansi_color.setup_env_for_colors;
+    Log.info log ("Workspace root: " ^ !Clflags.workspace_root);
+    cwd := (
+      let cwd = Sys.getcwd () in
+      if cwd <> initial_cwd then
+        Printf.eprintf "Entering directory '%s'\n%!" cwd;
+      cwd);
+    let t =
+      iter_errors (fun () -> t) ~on_error:(fun exn ->
+        Format.eprintf "%a@?" Report_error.report exn)
+    in
+    let result = ref None in
+    t (Execution_context.create ()) (fun x -> result := Some x);
+    match go_rec log result with
+    | Ok x -> x
+    | Error _ -> die ""
+end
+
+module Fancy = struct
   let split_prog s =
     let len = String.length s in
     if len = 0 then
@@ -529,7 +583,7 @@ module Scheduler = struct
       "-o" :: Ansi_color.(apply_string output_filename) fn :: colorize_args rest
     | x :: rest -> x :: colorize_args rest
 
-  let command_line { prog; args; dir; stdout_to; stderr_to; _ } =
+  let command_line ~prog ~args ~dir ~stdout_to ~stderr_to =
     let quote = quote_for_shell in
     let prog = colorize_prog (quote prog) in
     let s = String.concat (prog :: colorize_args (List.map args ~f:quote)) ~sep:" " in
@@ -598,221 +652,146 @@ module Scheduler = struct
         target_names_grouped_by_prefix
         pp_contexts
         contexts;
-
-  type running_job =
-    { id              : int
-    ; job             : job
-    ; pid             : int
-    ; output_filename : string option
-    ; (* for logs, with ansi colors code always included in the string *)
-      command_line    : string
-    ; log             : Log.t
-    }
-
-  module Running_jobs : sig
-    val add : running_job -> unit
-    val wait : unit -> running_job * Unix.process_status
-    val count : unit -> int
-  end = struct
-    let all = Hashtbl.create 128
-
-    let add job = Hashtbl.add all ~key:job.pid ~data:job
-
-    let count () = Hashtbl.length all
-
-    let resolve_and_remove_job pid =
-      let job =
-        Hashtbl.find_exn all pid ~string_of_key:(sprintf "<pid:%d>")
-          ~table_desc:(fun _ -> "<running-jobs>")
-      in
-      Hashtbl.remove all pid;
-      job
-
-    exception Finished of running_job * Unix.process_status
-
-    let wait_nonblocking_win32 () =
-      match
-        Hashtbl.iter all ~f:(fun ~key:pid ~data:job ->
-          let pid, status = Unix.waitpid [WNOHANG] pid in
-          if pid <> 0 then
-            raise_notrace (Finished (job, status)))
-      with
-      | () -> None
-      | exception (Finished (job, status)) ->
-        Hashtbl.remove all job.pid;
-        Some (job, status)
-
-    let rec wait_win32 () =
-      match wait_nonblocking_win32 () with
-      | None ->
-        ignore (Unix.select [] [] [] 0.001);
-        wait_win32 ()
-      | Some x -> x
-
-    let wait_unix () =
-      let pid, status = Unix.wait () in
-      (resolve_and_remove_job pid, status)
-
-    let wait =
-      if Sys.win32 then
-        wait_win32
-      else
-        wait_unix
-  end
-
-  let process_done job (status : Unix.process_status) =
-    let output =
-      match job.output_filename with
-      | None -> ""
-      | Some fn ->
-        let s = Io.read_file fn in
-        Temp.destroy fn;
-        let len = String.length s in
-        if len > 0 && s.[len - 1] <> '\n' then
-          s ^ "\n"
-        else
-          s
-    in
-    Log.command job.log
-      ~command_line:job.command_line
-      ~output:output
-      ~exit_status:status;
-    let _, progname, _ = split_prog job.job.prog in
-    match status with
-    | WEXITED n when code_is_ok job.job.ok_codes n ->
-      if !Clflags.verbose then begin
-        if output <> "" then
-          Format.eprintf "@{<kwd>Output@}[@{<id>%d@}]:\n%s%!" job.id output;
-        if n <> 0 then
-          Format.eprintf
-            "@{<warning>Warning@}: Command [@{<id>%d@}] exited with code %d, \
-             but I'm ignore it, hope that's OK.\n%!" job.id n;
-      end else if (output <> "" || job.job.purpose <> Internal_job) then
-        begin
-          Format.eprintf "@{<ok>%12s@} %a@." progname pp_purpose job.job.purpose;
-          Format.eprintf "%s%!" output;
-        end;
-      Handler.run job.job.handler n
-    | WEXITED n ->
-      if !Clflags.verbose then begin
-        Format.eprintf "\n@{<kwd>Command@} [@{<id>%d@}] exited with code %d:\n\
-                        @{<prompt>$@} %s\n%s%!"
-          job.id n
-          (Ansi_color.strip_colors_for_stderr job.command_line)
-          (Ansi_color.strip_colors_for_stderr output)
-      end else begin
-        Format.eprintf "@{<error>%12s@} %a @{<error>(exit %d)@}@."
-          progname pp_purpose job.job.purpose n;
-        Format.eprintf "@{<details>%s@}@."
-          (Ansi_color.strip job.command_line);
-        Format.eprintf "%s%!" output;
-      end;
-      job.job.handler.ctx.on_error (Fatal_error "")
-    | WSIGNALED n ->
-      if !Clflags.verbose then begin
-        Format.eprintf "\n@{<kwd>Command@} [@{<id>%d@}] got signal %s:\n\
-                        @{<prompt>$@} %s\n%s%!"
-          job.id (Utils.signal_name n)
-          (Ansi_color.strip_colors_for_stderr job.command_line)
-          (Ansi_color.strip_colors_for_stderr output);
-      end else begin
-        Format.eprintf "@{<error>%12s@} %a @{<error>(got signal %s)@}@."
-          progname pp_purpose job.job.purpose (Utils.signal_name n);
-        Format.eprintf "@{<details>%s@}@."
-          (Ansi_color.strip job.command_line);
-        Format.eprintf "%s%!" output;
-      end;
-      job.job.handler.ctx.on_error (Fatal_error "")
-    | WSTOPPED _ -> assert false
-
-  let gen_id =
-    let next = ref (-1) in
-    fun () -> incr next; !next
-
-  let at_exit_after_waiting_for_commands = at_exit
-
-  let get_std_output ~default = function
-    | Terminal -> (default, None)
-    | File fn ->
-      let fd = Unix.openfile fn [O_WRONLY; O_CREAT; O_TRUNC; O_SHARE_DELETE] 0o666 in
-      (fd, Some (Fd fd))
-    | Opened_file { desc; tail; _ } ->
-      let fd =
-        match desc with
-        | Fd      fd -> fd
-        | Channel oc -> flush oc; Unix.descr_of_out_channel oc
-      in
-      (fd, Option.some_if tail desc)
-
-  let close_std_output = function
-    | None -> ()
-    | Some (Fd      fd) -> Unix.close fd
-    | Some (Channel oc) -> close_out  oc
-
-  let rec go_rec cwd log result =
-    match !result with
-    | Some x -> x
-    | None ->
-      while Running_jobs.count () < !Clflags.concurrency &&
-            not (Queue.is_empty to_run) do
-        let job = Queue.pop to_run in
-        let id = gen_id () in
-        let command_line = command_line job in
-        if !Clflags.verbose then
-          Format.eprintf "@{<kwd>Running@}[@{<id>%d@}]: %s@." id
-            (Ansi_color.strip_colors_for_stderr command_line);
-        let argv = Array.of_list (job.prog :: job.args) in
-        let output_filename, stdout_fd, stderr_fd, to_close =
-          match job.stdout_to, job.stderr_to with
-          | (Terminal, _ | _, Terminal) when !Clflags.capture_outputs ->
-            let fn = Temp.create "jbuilder" ".output" in
-            let fd = Unix.openfile fn [O_WRONLY; O_SHARE_DELETE] 0 in
-            (Some fn, fd, fd, Some fd)
-          | _ ->
-            (None, Unix.stdout, Unix.stderr, None)
-        in
-        let stdout, close_stdout = get_std_output job.stdout_to ~default:stdout_fd in
-        let stderr, close_stderr = get_std_output job.stderr_to ~default:stderr_fd in
-        Option.iter job.dir ~f:(fun dir -> Sys.chdir dir);
-        let pid =
-          match job.env with
-          | None ->
-            Unix.create_process job.prog argv
-              Unix.stdin stdout stderr
-          | Some env ->
-            Unix.create_process_env job.prog argv env
-              Unix.stdin stdout stderr
-        in
-        Option.iter job.dir ~f:(fun _ -> Sys.chdir cwd);
-        Option.iter to_close ~f:Unix.close;
-        close_std_output close_stdout;
-        close_std_output close_stderr;
-        Running_jobs.add
-          { id
-          ; job
-          ; pid
-          ; output_filename
-          ; command_line
-          ; log
-          }
-      done;
-      let job, status = Running_jobs.wait () in
-      process_done job status;
-      go_rec cwd log result
-
-  let go ?(log=Log.no_log) t =
-    Lazy.force Ansi_color.setup_env_for_colors;
-    Log.info log ("Workspace root: " ^ !Clflags.workspace_root);
-    let cwd = Sys.getcwd () in
-    if cwd <> initial_cwd then
-      Printf.eprintf "Entering directory '%s'\n%!" cwd;
-    let t =
-      iter_errors (fun () -> t) ~on_error:(fun exn ->
-        Format.eprintf "%a@?" Report_error.report exn)
-    in
-    let result = ref None in
-    t (Execution_context.create ()) (fun x -> result := Some x);
-    match go_rec cwd log result with
-    | Ok x -> x
-    | Error _ -> die ""
 end
+
+let get_std_output ~default = function
+  | Terminal -> (default, None)
+  | File fn ->
+    let fd = Unix.openfile fn [O_WRONLY; O_CREAT; O_TRUNC; O_SHARE_DELETE] 0o666 in
+    (fd, Some (Fd fd))
+  | Opened_file { desc; tail; _ } ->
+    let fd =
+      match desc with
+      | Fd      fd -> fd
+      | Channel oc -> flush oc; Unix.descr_of_out_channel oc
+    in
+    (fd, Option.some_if tail desc)
+
+let close_std_output = function
+  | None -> ()
+  | Some (Fd      fd) -> Unix.close fd
+  | Some (Channel oc) -> close_out  oc
+
+let gen_id =
+  let next = ref (-1) in
+  fun () -> incr next; !next
+
+let run_internal ?dir ?(stdout_to=Terminal) ?(stderr_to=Terminal) ?env ~purpose fail_mode prog args : int t =
+  Scheduler.wait_for_slot >>= fun () ->
+  let dir =
+    match dir with
+    | Some "." -> None
+    | _ -> dir
+  in
+  let id = gen_id () in
+  let ok_codes = accepted_codes fail_mode in
+  let command_line = Fancy.command_line ~prog ~args ~dir ~stdout_to ~stderr_to in
+  if !Clflags.verbose then
+    Format.eprintf "@{<kwd>Running@}[@{<id>%d@}]: %s@." id
+      (Ansi_color.strip_colors_for_stderr command_line);
+  let argv = Array.of_list (prog :: args) in
+  let output_filename, stdout_fd, stderr_fd, to_close =
+    match stdout_to, stderr_to with
+    | (Terminal, _ | _, Terminal) when !Clflags.capture_outputs ->
+      let fn = Temp.create "jbuilder" ".output" in
+      let fd = Unix.openfile fn [O_WRONLY; O_SHARE_DELETE] 0 in
+      (Some fn, fd, fd, Some fd)
+    | _ ->
+      (None, Unix.stdout, Unix.stderr, None)
+  in
+  let stdout, close_stdout = get_std_output stdout_to ~default:stdout_fd in
+  let stderr, close_stderr = get_std_output stderr_to ~default:stderr_fd in
+  Option.iter dir ~f:(fun dir -> Sys.chdir dir);
+  let pid =
+    match env with
+    | None ->
+      Unix.create_process prog argv
+        Unix.stdin stdout stderr
+    | Some env ->
+      Unix.create_process_env prog argv env
+        Unix.stdin stdout stderr
+  in
+  Option.iter dir ~f:(fun _ -> Sys.chdir !Scheduler.cwd);
+  Option.iter to_close ~f:Unix.close;
+  close_std_output close_stdout;
+  close_std_output close_stderr;
+  Scheduler.wait_for_process ~pid ~command_line ~output_filename
+  >>| fun (output, status) ->
+  let _, progname, _ = Fancy.split_prog prog in
+  match status with
+  | WEXITED n when code_is_ok ok_codes n ->
+    if !Clflags.verbose then begin
+      if output <> "" then
+        Format.eprintf "@{<kwd>Output@}[@{<id>%d@}]:\n%s%!" id output;
+      if n <> 0 then
+        Format.eprintf
+          "@{<warning>Warning@}: Command [@{<id>%d@}] exited with code %d, \
+           but I'm ignore it, hope that's OK.\n%!" id n;
+    end else if (output <> "" || purpose <> Internal_job) then
+      begin
+        Format.eprintf "@{<ok>%12s@} %a@." progname Fancy.pp_purpose purpose;
+        Format.eprintf "%s%!" output;
+      end;
+    n
+  | WEXITED n ->
+    if !Clflags.verbose then
+      die "\n@{<kwd>Command@} [@{<id>%d@}] exited with code %d:\n\
+           @{<prompt>$@} %s\n%s"
+        id n
+        (Ansi_color.strip_colors_for_stderr command_line)
+        (Ansi_color.strip_colors_for_stderr output)
+    else
+      die "@{<error>%12s@} %a @{<error>(exit %d)@}\n\
+           @{<details>%s@}\n\
+           %s"
+        progname Fancy.pp_purpose purpose n
+        (Ansi_color.strip command_line)
+        output
+  | WSIGNALED n ->
+    if !Clflags.verbose then
+      die "\n@{<kwd>Command@} [@{<id>%d@}] got signal %s:\n\
+           @{<prompt>$@} %s\n%s"
+        id (Utils.signal_name n)
+        (Ansi_color.strip_colors_for_stderr command_line)
+        (Ansi_color.strip_colors_for_stderr output)
+    else
+      die "@{<error>%12s@} %a @{<error>(got signal %s)@}\n\
+           @{<details>%s@}\n\
+           %s"
+        progname Fancy.pp_purpose purpose (Utils.signal_name n)
+        (Ansi_color.strip command_line)
+        output
+  | WSTOPPED _ -> assert false
+
+let run ?dir ?stdout_to ?stderr_to ?env ?(purpose=Internal_job) fail_mode prog args =
+  map_result fail_mode (run_internal ?dir ?stdout_to ?stderr_to ?env ~purpose fail_mode prog args)
+    ~f:ignore
+
+let run_capture_gen ?dir ?env ?(purpose=Internal_job) fail_mode prog args ~f =
+  let fn = Temp.create "jbuild" ".output" in
+  map_result fail_mode (run_internal ?dir ~stdout_to:(File fn) ?env ~purpose fail_mode prog args)
+    ~f:(fun () ->
+      let x = f fn in
+      Temp.destroy fn;
+      x)
+
+let run_capture       = run_capture_gen ~f:Io.read_file
+let run_capture_lines = run_capture_gen ~f:Io.lines_of_file
+
+let run_capture_line ?dir ?env ?(purpose=Internal_job) fail_mode prog args =
+  run_capture_gen ?dir ?env ~purpose fail_mode prog args ~f:(fun fn ->
+    match Io.lines_of_file fn with
+    | [x] -> x
+    | l ->
+      let cmdline =
+        let s = String.concat (prog :: args) ~sep:" " in
+        match dir with
+        | None -> s
+        | Some dir -> sprintf "cd %s && %s" dir s
+      in
+      match l with
+      | [] ->
+        die "command returned nothing: %s" cmdline
+      | _ ->
+        die "command returned too many lines: %s\n%s"
+          cmdline (String.concat l ~sep:"\n"))

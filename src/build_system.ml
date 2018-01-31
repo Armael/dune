@@ -503,7 +503,7 @@ let create_file_specs t targets rule ~copy_source =
 let pending_targets = ref Pset.empty
 
 let () =
-  Fiber.Scheduler.at_exit_after_waiting_for_commands (fun () ->
+  at_exit (fun () ->
     let fns = !pending_targets in
     pending_targets := Pset.empty;
     Pset.iter fns ~f:Path.unlink_no_err)

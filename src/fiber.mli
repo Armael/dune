@@ -233,8 +233,4 @@ val run_capture_lines
 module Scheduler : sig
   (** [go ?log t] runs the following fiber until it terminates. *)
   val go : ?log:Log.t -> 'a t -> 'a
-
-  (** Executes [f] before exiting, after all pending commands have
-      finished *)
-  val at_exit_after_waiting_for_commands : (unit -> unit) -> unit
 end

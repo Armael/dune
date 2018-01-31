@@ -22,7 +22,10 @@ let report_with_backtrace ppf exn ~backtrace =
     false
   | Fatal_error "" -> false
   | Fatal_error msg ->
-    Format.fprintf ppf "%s\n" (String.capitalize_ascii msg);
+    if msg.[String.length msg - 1] = '\n' then
+      Format.fprintf ppf "%s" msg
+    else
+      Format.fprintf ppf "%s\n" (String.capitalize_ascii msg);
     false
   | Findlib.Package_not_available { package; required_by; reason } ->
     Format.fprintf ppf
