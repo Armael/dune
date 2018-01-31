@@ -49,16 +49,44 @@ module Int_map = Map.Make(struct
 module Execution_context = struct
   type t =
     { on_error : exn -> unit (* This callback must never raise *)
-    ; fibers   : int ref (* number of fibers running in this
-                            execution context *)
+    ; fibers   : int ref (* Number of fibers running in this execution
+                            context *)
     ; vars     : Binding.t Int_map.t
+    ; stack    : string list ref
     }
 
   let create () =
     { on_error = reraise
     ; fibers   = ref 0
     ; vars     = Int_map.empty
+    ; stack    = ref []
     }
+
+  let forward_error t pos exn =
+    let bt = Printexc.get_raw_backtrace () in
+    t.stack := pos :: !(t.stack);
+    try
+      t.on_error exn
+    with exn2 ->
+      (* We can't abort the execution at this point, so we just dump
+         the error on stderr *)
+      let bt2 = Printexc.get_backtrace () in
+      let s =
+        (sprintf "%s\n%s\nOriginal exception was: %s\n%s"
+           (Printexc.to_string exn2) bt2
+           (Printexc.to_string exn) (Printexc.raw_backtrace_to_string bt))
+        |> String.split_lines
+        |> List.map ~f:(sprintf "| %s")
+        |> String.concat ~sep:"\n"
+      in
+      let line = String.make 71 '-' in
+      Format.eprintf
+        "/%s\n\
+         | @{<error>Internal error@}: \
+         Fiber.Execution_context.forward_error: error handler raised.\n\
+         %s\n\
+         \\%s@."
+        line s line
 end
 
 open Execution_context
@@ -99,7 +127,7 @@ let fork fa fb ctx k =
         | Got_a _ -> assert false
         | Got_b b -> k (a, b))
     with exn ->
-      ctx.on_error exn
+      forward_error ctx "fork" exn
   end;
   fb () ctx (fun b ->
     match !state with
@@ -118,7 +146,7 @@ let fork_unit fa fb ctx k =
         | Got_a _ -> assert false
         | Got_b b -> k b)
     with exn ->
-      ctx.on_error exn
+      forward_error ctx "fork_unit" exn
   end;
   fb () ctx (fun b ->
     match !state with
@@ -158,7 +186,7 @@ let nfork_map l ~f ctx k =
           else
             decr ctx.fibers)
       with exn ->
-        ctx.on_error exn)
+        forward_error ctx "nfork_map" exn)
 
 let nfork_iter l ~f ctx k =
   match l with
@@ -176,7 +204,7 @@ let nfork_iter l ~f ctx k =
       try
         f x ctx k
       with exn ->
-        ctx.on_error exn)
+        forward_error ctx "nfork_iter" exn)
 
 module Var = struct
   include Var0
@@ -211,7 +239,17 @@ end
 
 let iter_errors_internal f ~on_error ctx k =
   let fibers = ref 1 in
+  let finished = ref false in
+  let stack = ref [] in
+  let check () =
+    if !finished then begin
+      List.iter (List.rev !stack) ~f:prerr_endline;
+      assert false
+    end
+  in
   let on_error exn =
+    check ();
+    stack := sprintf "error %d" !fibers :: !stack;
     let n = !fibers - 1 in
     assert (n >= 0);
     fibers := n;
@@ -219,28 +257,39 @@ let iter_errors_internal f ~on_error ctx k =
       match on_error with
       | None ->
         incr ctx.fibers;
-        ctx.on_error exn
+        forward_error ctx "iter_errors 1" exn
       | Some f ->
         try
           f exn
         with exn ->
           incr ctx.fibers;
-          ctx.on_error exn
+          forward_error ctx "iter_errors 2" exn
     end;
-    if n = 0 then
+    if n = 0 then (
+      check ();
+      finished := true;
+      stack := "raised" :: !stack;
       try
         k (Error ())
       with exn ->
-        ctx.on_error exn
+        forward_error ctx "iter_errors 3" exn
+    )
   in
-  let ctx = { ctx with on_error; fibers } in
+  let sub_ctx = { ctx with on_error; fibers; stack } in
   try
-    f () ctx (fun x ->
+    f () sub_ctx (fun x ->
+      check ();
+      finished := true;
+      stack := "done" :: !stack;
       assert (!fibers = 1);
       fibers := 0;
-      k (Ok x))
-  with exn when !fibers > 0 ->
-    on_error exn
+      try
+        k (Ok x)
+      with exn ->
+        forward_error ctx "iter_errors 4" exn);
+    stack := "delayed" :: !stack
+  with exn ->
+    forward_error sub_ctx "iter_errors 5" exn
 
 let wait_errors f = iter_errors_internal f ~on_error:None
 let iter_errors f ~on_error = iter_errors_internal f ~on_error:(Some on_error)
@@ -278,15 +327,7 @@ module Handler = struct
     try
       t.run x
     with exn ->
-      try
-        t.ctx.on_error exn
-      with exn ->
-        let bt = Printexc.get_backtrace () |> String.split_lines in
-        Sexp.code_error
-          "Fiber.Handler.run: error handler raised"
-          [ "exn"      , Atom (Printexc.to_string exn)
-          ; "backtrace", Sexp.To_sexp.(list string) bt
-          ]
+      forward_error t.ctx "handler" exn
 end
 
 module Ivar = struct
@@ -312,12 +353,21 @@ module Ivar = struct
   let read t ctx k =
     match t.state with
     | Full  x -> k x
-    | Empty q -> Queue.push { Handler. run = k; ctx } q
+    | Empty q ->
+      ctx.stack := "read" :: !(ctx.stack);
+      Queue.push { Handler. run = k; ctx } q
 end
 
 exception Already_reported
 
-let memoize t =
+let n = ref String_set.empty
+let p = ref String_set.empty
+let () = at_exit (fun () ->
+  String_set.iter !n ~f:(Printf.eprintf "empty: %S\n%!"))
+
+let memoize s t =
+  if String_set.mem s !p then failwith s;
+  p := String_set.add s !p;
   let cell = ref None in
   delay (fun () ->
     match !cell with
@@ -328,7 +378,9 @@ let memoize t =
     | None ->
       let ivar = Ivar.create () in
       cell := Some ivar;
+      n := String_set.add s !n;
       wait_errors (fun () -> t) >>= fun res ->
+      n := String_set.remove s !n;
       Ivar.fill ivar res >>| fun () ->
       match res with
       | Ok x -> x
@@ -342,6 +394,7 @@ module Mutex = struct
 
   let lock t ctx k =
     if t.locked then
+      let () = ctx.stack := "lock" :: !(ctx.stack) in
       Queue.push { Handler. run = k; ctx } t.waiters
     else begin
       t.locked <- true;
@@ -435,9 +488,11 @@ module Scheduler = struct
     if Running_jobs.count () < !Clflags.concurrency then
       k (Var.find_exn ctx info_var)
     else
+      let () = ctx.stack := "wait job" :: !(ctx.stack) in
       Queue.push { Handler. ctx; run = k } waiting_for_available_job
 
   let wait_for_process pid ctx k =
+    let () = ctx.stack := "wait proc" :: !(ctx.stack) in
     Running_jobs.add
       { pid
       ; handler = { Handler. ctx; run = k }

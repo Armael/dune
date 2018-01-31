@@ -29,7 +29,7 @@ end
 
 exception Already_reported
 
-val memoize : 'a t -> 'a t
+val memoize : string -> 'a t -> 'a t
 
 (** {1 Combining} *)
 
