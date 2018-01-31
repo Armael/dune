@@ -1,7 +1,5 @@
 open Import
 
-let ( += ) r x = r := !r + x
-
 module Var0 = struct
   module Key = struct
     type 'a t = ..
@@ -46,21 +44,61 @@ module Int_map = Map.Make(struct
     let compare : int -> int -> int = compare
   end)
 
-module Execution_context = struct
+module Execution_context : sig
+  type t
+
+  val create_initial : unit -> t
+  val forward_error : t -> string -> exn -> unit
+
+  val add_refs : t -> int -> unit
+  val deref : t -> unit
+  val refs : t -> int
+
+  val create_sub
+    :  t
+    -> on_error:(exn -> unit)
+    -> stack:string list ref
+    -> on_release:(unit -> unit)
+    -> t
+
+  val vars : t -> Binding.t Int_map.t
+  val set_vars : t -> Binding.t Int_map.t -> t
+
+  val mark : t -> string -> unit
+  val stack : t -> string list
+end = struct
   type t =
     { on_error : exn -> unit (* This callback must never raise *)
     ; fibers   : int ref (* Number of fibers running in this execution
                             context *)
     ; vars     : Binding.t Int_map.t
+    ; on_release : unit -> unit
     ; stack    : string list ref
     }
 
-  let create () =
-    { on_error = reraise
-    ; fibers   = ref 0
-    ; vars     = Int_map.empty
-    ; stack    = ref []
+  let mark t s = t.stack := s :: !(t.stack)
+  let stack t = List.rev !(t.stack)
+
+  let vars t = t.vars
+  let set_vars t vars = { t with vars }
+
+  let create_initial () =
+    { on_error   = reraise
+    ; fibers     = ref 0
+    ; vars       = Int_map.empty
+    ; stack      = ref []
+    ; on_release = ignore
     }
+
+  let refs t = !(t.fibers)
+
+  let add_refs t n = t.fibers := !(t.fibers) + n
+
+  let deref t =
+    let n = !(t.fibers) - 1 in
+    assert (n >= 0);
+    t.fibers := n;
+    if n = 0 then t.on_release ()
 
   let forward_error t pos exn =
     let bt = Printexc.get_raw_backtrace () in
@@ -87,9 +125,16 @@ module Execution_context = struct
          %s\n\
          \\%s@."
         line s line
+
+  let forward_error t pos exn =
+    forward_error t pos exn;
+    deref t
+
+  let create_sub t ~on_error ~stack ~on_release =
+    { t with on_error; stack; on_release; fibers = ref 1 }
 end
 
-open Execution_context
+module EC = Execution_context
 
 type 'a t = Execution_context.t -> ('a -> unit) -> unit
 
@@ -118,39 +163,39 @@ type ('a, 'b) both_state =
 
 let fork fa fb ctx k =
   let state = ref Nothing_yet in
-  incr ctx.fibers;
+  EC.add_refs ctx 1;
   begin
     try
       fa () ctx (fun a ->
         match !state with
-        | Nothing_yet -> decr ctx.fibers; state := Got_a a
+        | Nothing_yet -> EC.deref ctx; state := Got_a a
         | Got_a _ -> assert false
         | Got_b b -> k (a, b))
     with exn ->
-      forward_error ctx "fork" exn
+      EC.forward_error ctx "fork" exn
   end;
   fb () ctx (fun b ->
     match !state with
-    | Nothing_yet -> decr ctx.fibers; state := Got_b b
+    | Nothing_yet -> EC.deref ctx; state := Got_b b
     | Got_a a -> k (a, b)
     | Got_b _ -> assert false)
 
 let fork_unit fa fb ctx k =
   let state = ref Nothing_yet in
-  incr ctx.fibers;
+  EC.add_refs ctx 1;
   begin
     try
       fa () ctx (fun () ->
         match !state with
-        | Nothing_yet -> decr ctx.fibers; state := Got_a ()
+        | Nothing_yet -> EC.deref ctx; state := Got_a ()
         | Got_a _ -> assert false
         | Got_b b -> k b)
     with exn ->
-      forward_error ctx "fork_unit" exn
+      EC.forward_error ctx "fork_unit" exn
   end;
   fb () ctx (fun b ->
     match !state with
-    | Nothing_yet -> decr ctx.fibers; state := Got_b b
+    | Nothing_yet -> EC.deref ctx; state := Got_b b
     | Got_a () -> k b
     | Got_b _ -> assert false)
 
@@ -173,7 +218,7 @@ let nfork_map l ~f ctx k =
   | [x] -> f x ctx (fun x -> k [x])
   | _ ->
     let n = List.length l in
-    ctx.fibers += (n - 1);
+    EC.add_refs ctx (n - 1);
     let left_over = ref n in
     let results = Array.make n None in
     List.iteri l ~f:(fun i x ->
@@ -184,9 +229,9 @@ let nfork_map l ~f ctx k =
           if !left_over = 0 then
             k (list_of_option_array results)
           else
-            decr ctx.fibers)
+            EC.deref ctx)
       with exn ->
-        forward_error ctx "nfork_map" exn)
+        EC.forward_error ctx "nfork_map" exn)
 
 let nfork_iter l ~f ctx k =
   match l with
@@ -194,17 +239,17 @@ let nfork_iter l ~f ctx k =
   | [x] -> f x ctx k
   | _ ->
     let n = List.length l in
-    ctx.fibers += (n - 1);
+    EC.add_refs ctx (n - 1);
     let left_over = ref n in
     let k () =
       decr left_over;
-      if !left_over = 0 then k () else decr ctx.fibers
+      if !left_over = 0 then k () else EC.deref ctx
     in
     List.iter l ~f:(fun x ->
       try
         f x ctx k
       with exn ->
-        forward_error ctx "nfork_iter" exn)
+        EC.forward_error ctx "nfork_iter" exn)
 
 module Var = struct
   include Var0
@@ -212,14 +257,14 @@ module Var = struct
   let cast (type a) (type b) (Eq : (a, b) eq) (x : a) : b = x
 
   let find ctx var =
-    match Int_map.find (id var) ctx.vars with
+    match Int_map.find (id var) (EC.vars ctx) with
     | None -> None
     | Some (Binding.T (var', v)) ->
       let eq = eq var' var in
       Some (cast eq v)
 
   let find_exn ctx var =
-    match Int_map.find (id var) ctx.vars with
+    match Int_map.find (id var) (EC.vars ctx) with
     | None -> failwith "Fiber.Var.find_exn"
     | Some (Binding.T (var', v)) ->
       let eq = eq var' var in
@@ -231,13 +276,23 @@ module Var = struct
   let set (type a) (var : a t) x fiber ctx k =
     let (module M) = var in
     let data = Binding.T (var, x) in
-    let ctx =
-      { ctx with vars = Int_map.add ctx.vars ~key:M.id ~data }
-    in
+    let ctx = EC.set_vars ctx (Int_map.add (EC.vars ctx) ~key:M.id ~data) in
     fiber ctx k
 end
 
-let iter_errors_internal f ~on_error ctx k =
+let n = ref 0
+let db = Hashtbl.create 128
+
+let () = at_exit (fun () ->
+  if false then
+  Hashtbl.iter db ~f:(fun ~key:n ~data:ctx ->
+    let open Printf in
+    eprintf "------------ %d: %d\n%!" n (EC.refs ctx);
+    List.iter (EC.stack ctx) ~f:(eprintf "%s\n%!")))
+
+let iter_errors_internal (f : unit -> _ t) ~on_error ctx k =
+  incr n;
+  let id = !n in
   let fibers = ref 1 in
   let finished = ref false in
   let stack = ref [] in
@@ -249,47 +304,41 @@ let iter_errors_internal f ~on_error ctx k =
   in
   let on_error exn =
     check ();
-    stack := sprintf "error %d" !fibers :: !stack;
-    let n = !fibers - 1 in
-    assert (n >= 0);
-    fibers := n;
-    begin
-      match on_error with
-      | None ->
-        incr ctx.fibers;
-        forward_error ctx "iter_errors 1" exn
-      | Some f ->
-        try
-          f exn
-        with exn ->
-          incr ctx.fibers;
-          forward_error ctx "iter_errors 2" exn
-    end;
-    if n = 0 then (
-      check ();
-      finished := true;
-      stack := "raised" :: !stack;
+    match on_error with
+    | None ->
+      EC.add_refs ctx 1;
+      EC.forward_error ctx "iter_errors 1" exn
+    | Some f ->
       try
-        k (Error ())
+        f exn
       with exn ->
-        forward_error ctx "iter_errors 3" exn
-    )
+        EC.add_refs ctx 1;
+        EC.forward_error ctx "iter_errors 2" exn
   in
-  let sub_ctx = { ctx with on_error; fibers; stack } in
+  let result = ref (Error ()) in
+  let on_release () =
+    check ();
+    finished := true;
+    stack := "raised" :: !stack;
+    Hashtbl.remove db id;
+    try
+      k !result
+    with exn ->
+      EC.forward_error ctx "iter_errors 3" exn
+  in
+  let sub_ctx = EC.create_sub ctx ~on_error ~stack ~on_release in
+  Hashtbl.add db ~key:id ~data:sub_ctx;
   try
     f () sub_ctx (fun x ->
-      check ();
-      finished := true;
       stack := "done" :: !stack;
       assert (!fibers = 1);
       fibers := 0;
-      try
-        k (Ok x)
-      with exn ->
-        forward_error ctx "iter_errors 4" exn);
-    stack := "delayed" :: !stack
+      Hashtbl.remove db id;
+      result := Ok x;
+      EC.deref sub_ctx);
+    EC.mark sub_ctx "delayed"
   with exn ->
-    forward_error sub_ctx "iter_errors 5" exn
+    EC.forward_error sub_ctx "iter_errors 5" exn
 
 let wait_errors f = iter_errors_internal f ~on_error:None
 let iter_errors f ~on_error = iter_errors_internal f ~on_error:(Some on_error)
@@ -327,7 +376,7 @@ module Handler = struct
     try
       t.run x
     with exn ->
-      forward_error t.ctx "handler" exn
+      EC.forward_error t.ctx "handler" exn
 end
 
 module Ivar = struct
@@ -354,7 +403,7 @@ module Ivar = struct
     match t.state with
     | Full  x -> k x
     | Empty q ->
-      ctx.stack := "read" :: !(ctx.stack);
+      EC.mark ctx "read";
       Queue.push { Handler. run = k; ctx } q
 end
 
@@ -365,7 +414,7 @@ let p = ref String_set.empty
 let () = at_exit (fun () ->
   String_set.iter !n ~f:(Printf.eprintf "empty: %S\n%!"))
 
-let memoize s t =
+let memoize s (t : _ t) : _ t =
   if String_set.mem s !p then failwith s;
   p := String_set.add s !p;
   let cell = ref None in
@@ -394,7 +443,7 @@ module Mutex = struct
 
   let lock t ctx k =
     if t.locked then
-      let () = ctx.stack := "lock" :: !(ctx.stack) in
+      let () = EC.mark ctx "lock" in
       Queue.push { Handler. run = k; ctx } t.waiters
     else begin
       t.locked <- true;
@@ -488,11 +537,11 @@ module Scheduler = struct
     if Running_jobs.count () < !Clflags.concurrency then
       k (Var.find_exn ctx info_var)
     else
-      let () = ctx.stack := "wait job" :: !(ctx.stack) in
+      let () = EC.mark ctx "wait job" in
       Queue.push { Handler. ctx; run = k } waiting_for_available_job
 
   let wait_for_process pid ctx k =
-    let () = ctx.stack := "wait proc" :: !(ctx.stack) in
+    let () = EC.mark ctx "wait proc" in
     Running_jobs.add
       { pid
       ; handler = { Handler. ctx; run = k }
@@ -525,7 +574,7 @@ module Scheduler = struct
              Format.eprintf "%a@?" Report_error.report exn))
     in
     let result = ref None in
-    fiber (Execution_context.create ()) (fun x -> result := Some x);
+    fiber (Execution_context.create_initial ()) (fun x -> result := Some x);
     match go_rec info result with
     | Ok x -> x
     | Error _ -> die ""
