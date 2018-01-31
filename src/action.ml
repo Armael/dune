@@ -567,7 +567,7 @@ let chdirs =
 
 open Fiber.O
 
-let get_std_output : _ -> Fiber.std_output_to = function
+let get_std_output : _ -> Process.std_output_to = function
   | None          -> Terminal
   | Some (fn, oc) -> Opened_file { filename = fn; tail = false; desc = Channel oc }
 
@@ -656,7 +656,7 @@ end
 
 type exec_context =
   { context : Context.t option
-  ; purpose : Fiber.purpose
+  ; purpose : Process.purpose
   ; env     : string array
   }
 
@@ -678,7 +678,7 @@ let exec_run ~ectx ~dir ~env_extra ~stdout_to ~stderr_to prog args =
   let stdout_to = get_std_output stdout_to in
   let stderr_to = get_std_output stderr_to in
   let env = Context.extend_env ~vars:env_extra ~env:ectx.env in
-  Fiber.run Strict ~dir:(Path.to_string dir) ~env ~stdout_to ~stderr_to
+  Process.run Strict ~dir:(Path.to_string dir) ~env ~stdout_to ~stderr_to
     ~purpose:ectx.purpose
     (Path.reach_for_running ~from:dir prog) args
 
@@ -844,7 +844,7 @@ let exec ~targets ?context t =
     | Some c -> c.env
   in
   let targets = Path.Set.elements targets in
-  let purpose = Fiber.Build_job targets in
+  let purpose = Process.Build_job targets in
   let ectx = { purpose; context; env } in
   exec t ~ectx ~dir:Path.root ~env_extra:Env_var_map.empty
     ~stdout_to:None ~stderr_to:None

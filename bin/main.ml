@@ -860,8 +860,8 @@ let install_uninstall ~what =
          get_libdir context ~libdir_from_command_line
          >>= fun libdir ->
          Fiber.nfork_iter install_files ~f:(fun path ->
-           let purpose = Fiber.Build_job install_files in
-           Fiber.run ~purpose Strict (Path.to_string opam_installer)
+           let purpose = Process.Build_job install_files in
+           Process.run ~purpose Strict (Path.to_string opam_installer)
              ([ sprintf "-%c" what.[0]
               ; Path.to_string path
               ; "--prefix"

@@ -135,7 +135,7 @@ let opam_config_var ~env ~cache var =
     match Bin.opam with
     | None -> Fiber.return None
     | Some fn ->
-      Fiber.run_capture (Accept All) (Path.to_string fn) ~env ["config"; "var"; var]
+      Process.run_capture (Accept All) (Path.to_string fn) ~env ["config"; "var"; var]
       >>| function
       | Ok s ->
         let s = String.trim s in
@@ -200,7 +200,7 @@ let create ~(kind : Kind.t) ~path ~base_env ~env_extra ~name ~merlin
       match Sys.getenv "OCAMLFIND_CONF" with
       | s -> Fiber.return (Path.absolute s)
       | exception Not_found ->
-        Fiber.run_capture_line ~env Strict
+        Process.run_capture_line ~env Strict
           (Path.to_string fn) ["printconf"; "conf"]
         >>| Path.absolute)
   in
@@ -262,7 +262,7 @@ let create ~(kind : Kind.t) ~path ~base_env ~env_extra ~name ~merlin
             | None -> args
             | Some s -> "-toolchain" :: s :: args
           in
-          Fiber.run_capture_lines ~env Strict (Path.to_string fn) args
+          Process.run_capture_lines ~env Strict (Path.to_string fn) args
           >>| List.map ~f:Path.absolute
         | None ->
           (* If there no ocamlfind in the PATH, check if we have opam
@@ -280,7 +280,7 @@ let create ~(kind : Kind.t) ~path ~base_env ~env_extra ~name ~merlin
     Fiber.fork
       findlib_path
       (fun () ->
-         Fiber.run_capture_lines ~env Strict (Path.to_string ocamlc) ["-config"])
+         Process.run_capture_lines ~env Strict (Path.to_string ocamlc) ["-config"])
     >>= fun (findlib_path, ocamlc_config) ->
 
     let ocamlc_config =
@@ -472,9 +472,9 @@ let create_for_opam ?root ~targets ~switch ~name ?(merlin=false) () =
     (match root with
      | Some root -> Fiber.return root
      | None ->
-       Fiber.run_capture_line Strict (Path.to_string fn) ["config"; "var"; "root"])
+       Process.run_capture_line Strict (Path.to_string fn) ["config"; "var"; "root"])
     >>= fun root ->
-    Fiber.run_capture Strict (Path.to_string fn)
+    Process.run_capture Strict (Path.to_string fn)
       ["config"; "env"; "--root"; root; "--switch"; switch; "--sexp"]
     >>= fun s ->
     let vars =
@@ -522,7 +522,7 @@ let install_ocaml_libdir t =
   (* If ocamlfind is present, it has precedence over everything else. *)
   match which t "ocamlfind" with
   | Some fn ->
-    (Fiber.run_capture_line ~env:t.env Strict
+    (Process.run_capture_line ~env:t.env Strict
        (Path.to_string fn) ["printconf"; "destdir"]
      >>| fun s ->
      Some (Path.absolute s))
