@@ -5,14 +5,14 @@
         menhir src/test_menhir1.{ml,mli}
       ocamldep src/test.depends.ocamldep-output
       ocamldep src/test.dependsi.ocamldep-output
-        ocamlc src/test_menhir1.{cmi,cmti}
         ocamlc src/test_base.{cmi,cmti}
-      ocamlopt src/test_menhir1.{cmx,o}
-        ocamlc src/lexer1.{cmi,cmo,cmt}
+        ocamlc src/test_menhir1.{cmi,cmti}
       ocamlopt src/test_base.{cmx,o}
         ocamlc src/lexer2.{cmi,cmo,cmt}
-      ocamlopt src/lexer1.{cmx,o}
+      ocamlopt src/test_menhir1.{cmx,o}
+        ocamlc src/lexer1.{cmi,cmo,cmt}
       ocamlopt src/lexer2.{cmx,o}
         ocamlc src/test.{cmi,cmo,cmt}
+      ocamlopt src/lexer1.{cmx,o}
       ocamlopt src/test.{cmx,o}
       ocamlopt src/test.exe

@@ -5,10 +5,10 @@
       ocamldep q/q.dependsi.ocamldep-output
     ocamlmklib q/dllq_stubs.so,q/libq_stubs.a
         ocamlc q/q.{cmi,cmti}
-        ocamlc qnativerun/run.{cmi,cmo,cmt}
       ocamlopt q/q.{cmx,o}
-      ocamlopt qnativerun/run.{cmx,o}
+        ocamlc qnativerun/run.{cmi,cmo,cmt}
       ocamlopt q/q.{a,cmxa}
+      ocamlopt qnativerun/run.{cmx,o}
       ocamlopt qnativerun/run.exe
   42
 #  $ $JBUILDER exec -j1 ./qbyterun/run.bc --root .
