@@ -514,6 +514,8 @@ module Scheduler = struct
     match !result with
     | Some x -> x
     | None ->
+      if Running_jobs.count () = 0 then
+        code_errorf "Fiber.Scheduler.go: no more processes running";
       let job, status = Running_jobs.wait () in
       if not (Queue.is_empty waiting_for_slot) then Handler.run (Queue.pop waiting_for_slot) t;
       Handler.run job.handler status;
