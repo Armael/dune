@@ -48,7 +48,7 @@ module Int_map = Map.Make(struct
 
 module Execution_context = struct
   type t =
-    { on_error : exn -> unit
+    { on_error : exn -> unit (* This callback must never raise *)
     ; fibers   : int ref (* number of fibers running in this
                             execution context *)
     ; vars     : Binding.t Int_map.t
@@ -183,19 +183,22 @@ module Var = struct
 
   let cast (type a) (type b) (Eq : (a, b) eq) (x : a) : b = x
 
-  let get (type a) (var : a t) ctx k =
+  let find ctx var =
     match Int_map.find (id var) ctx.vars with
-    | None -> k None
+    | None -> None
     | Some (Binding.T (var', v)) ->
       let eq = eq var' var in
-      k (Some (cast eq v))
+      Some (cast eq v)
 
-  let get_exn var ctx k =
+  let find_exn ctx var =
     match Int_map.find (id var) ctx.vars with
-    | None -> failwith "Fiber.Var.get_exn"
+    | None -> failwith "Fiber.Var.find_exn"
     | Some (Binding.T (var', v)) ->
       let eq = eq var' var in
-      k (cast eq v)
+      cast eq v
+
+  let get     var ctx k = k (find     ctx var)
+  let get_exn var ctx k = k (find_exn ctx var)
 
   let set (type a) (var : a t) x fiber ctx k =
     let (module M) = var in
@@ -224,7 +227,11 @@ let iter_errors_internal f ~on_error ctx k =
           incr ctx.fibers;
           ctx.on_error exn
     end;
-    if n = 0 then k (Error ())
+    if n = 0 then
+      try
+        k (Error ())
+      with exn ->
+        ctx.on_error exn
   in
   let ctx = { ctx with on_error; fibers } in
   try
@@ -271,7 +278,15 @@ module Handler = struct
     try
       t.run x
     with exn ->
-      t.ctx.on_error exn
+      try
+        t.ctx.on_error exn
+      with exn ->
+        let bt = Printexc.get_backtrace () |> String.split_lines in
+        Sexp.code_error
+          "Fiber.Handler.run: error handler raised"
+          [ "exn"      , Atom (Printexc.to_string exn)
+          ; "backtrace", Sexp.To_sexp.(list string) bt
+          ]
 end
 
 module Ivar = struct
@@ -421,9 +436,7 @@ end
 module Scheduler = struct
   type running_job =
     { pid             : int
-    ; command_line    : string
-    ; output_filename : string option
-    ; handler         : (string * Unix.process_status) Handler.t
+    ; handler         : Unix.process_status Handler.t
     }
 
   module Running_jobs : sig
@@ -477,63 +490,50 @@ module Scheduler = struct
         wait_unix
   end
 
+  type t =
+    { log : Log.t
+    ; cwd : string
+    }
+
+  let t_var : t Var.t = Var.create ()
+
   let waiting_for_slot = Queue.create ()
   let wait_for_slot ctx k =
     if Running_jobs.count () < !Clflags.concurrency then
-      k ()
+      k (Var.find_exn ctx t_var)
     else
       Queue.push { Handler. ctx; run = k } waiting_for_slot
 
-  let wait_for_process ~pid ~command_line ~output_filename ctx k =
+  let wait_for_process pid ctx k =
     Running_jobs.add
       { pid
-      ; command_line
-      ; output_filename
       ; handler = { Handler. ctx; run = k }
       }
 
-  let rec go_rec log result =
+  let rec go_rec t result =
     match !result with
     | Some x -> x
     | None ->
       let job, status = Running_jobs.wait () in
-      if not (Queue.is_empty waiting_for_slot) then Handler.run (Queue.pop waiting_for_slot) ();
-      let output =
-        match job.output_filename with
-        | None -> ""
-        | Some fn ->
-          let s = Io.read_file fn in
-          Temp.destroy fn;
-          let len = String.length s in
-          if len > 0 && s.[len - 1] <> '\n' then
-            s ^ "\n"
-          else
-            s
-      in
-      Log.command log
-        ~command_line:job.command_line
-        ~output:output
-        ~exit_status:status;
-      Handler.run job.handler (output, status);
-      go_rec log result
+      if not (Queue.is_empty waiting_for_slot) then Handler.run (Queue.pop waiting_for_slot) t;
+      Handler.run job.handler status;
+      go_rec t result
 
-  let cwd = ref ""
-
-  let go ?(log=Log.no_log) t =
+  let go ?(log=Log.no_log) fiber =
     Lazy.force Ansi_color.setup_env_for_colors;
     Log.info log ("Workspace root: " ^ !Clflags.workspace_root);
-    cwd := (
-      let cwd = Sys.getcwd () in
-      if cwd <> initial_cwd then
-        Printf.eprintf "Entering directory '%s'\n%!" cwd;
-      cwd);
-    let t =
-      iter_errors (fun () -> t) ~on_error:(fun exn ->
-        Format.eprintf "%a@?" Report_error.report exn)
+    let cwd = Sys.getcwd () in
+    if cwd <> initial_cwd then
+      Printf.eprintf "Entering directory '%s'\n%!" cwd;
+    let t = { log; cwd } in
+    let fiber =
+      Var.set t_var t
+        (iter_errors (fun () -> fiber) ~on_error:(fun exn ->
+           Format.eprintf "%a@?" Report_error.report exn))
     in
     let result = ref None in
-    t (Execution_context.create ()) (fun x -> result := Some x);
-    match go_rec log result with
+    fiber (Execution_context.create ()) (fun x -> result := Some x);
+    match go_rec t result with
     | Ok x -> x
     | Error _ -> die ""
 end
@@ -677,7 +677,7 @@ let gen_id =
   fun () -> incr next; !next
 
 let run_internal ?dir ?(stdout_to=Terminal) ?(stderr_to=Terminal) ?env ~purpose fail_mode prog args : int t =
-  Scheduler.wait_for_slot >>= fun () ->
+  Scheduler.wait_for_slot >>= fun { Scheduler. log; cwd } ->
   let dir =
     match dir with
     | Some "." -> None
@@ -711,12 +711,28 @@ let run_internal ?dir ?(stdout_to=Terminal) ?(stderr_to=Terminal) ?env ~purpose 
       Unix.create_process_env prog argv env
         Unix.stdin stdout stderr
   in
-  Option.iter dir ~f:(fun _ -> Sys.chdir !Scheduler.cwd);
+  Option.iter dir ~f:(fun _ -> Sys.chdir cwd);
   Option.iter to_close ~f:Unix.close;
   close_std_output close_stdout;
   close_std_output close_stderr;
-  Scheduler.wait_for_process ~pid ~command_line ~output_filename
-  >>| fun (output, status) ->
+  Scheduler.wait_for_process pid
+  >>| fun status ->
+  let output =
+    match output_filename with
+    | None -> ""
+    | Some fn ->
+      let s = Io.read_file fn in
+      Temp.destroy fn;
+      let len = String.length s in
+      if len > 0 && s.[len - 1] <> '\n' then
+        s ^ "\n"
+      else
+        s
+  in
+  Log.command log
+    ~command_line:command_line
+    ~output:output
+    ~exit_status:status;
   let _, progname, _ = Fancy.split_prog prog in
   match status with
   | WEXITED n when code_is_ok ok_codes n ->
