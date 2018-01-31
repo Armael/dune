@@ -66,20 +66,11 @@ let report_build_error dep_path exn =
         (Printexc.raw_backtrace_to_string backtrace);
     Format.pp_print_flush ppf ()
 
-let set = ref Pset.empty
-let () =
-  at_exit (fun () ->
-    Pset.iter !set ~f:(fun p ->
-      Printf.eprintf "path: %s\n%!" (Path.to_string p)))
-
-let memoize_for s path f =
-  set := Pset.add path !set;
-  Fiber.memoize (s ^ " " ^ Path.to_string path)
+let memoize_for path f =
+  Fiber.memoize
     (Dep_path.push path (fun dep_path ->
        Fiber.iter_errors f ~on_error:(report_build_error dep_path)))
-  >>| fun res ->
-  set := Pset.remove path !set;
-  match res with
+  >>| function
   | Ok x -> x
   | Error () -> raise Fiber.Already_reported
 
@@ -993,8 +984,8 @@ and wait_for_file_found fn (File_spec.T file) =
   match file.rule.exec with
   | Not_started { eval_rule; exec_rule } ->
     file.rule.exec <- Starting;
-    let rule_evaluation = memoize_for "eval" fn eval_rule in
-    let rule_execution  = memoize_for "exec" fn (fun () -> exec_rule rule_evaluation) in
+    let rule_evaluation = memoize_for fn eval_rule in
+    let rule_execution  = memoize_for fn (fun () -> exec_rule rule_evaluation) in
     file.rule.exec <-
       Running { rule_evaluation
               ; rule_execution
@@ -1003,7 +994,7 @@ and wait_for_file_found fn (File_spec.T file) =
   | Running { rule_execution; _ } -> rule_execution
   | Evaluating_rule { rule_evaluation; exec_rule } ->
     file.rule.exec <- Starting;
-    let rule_execution = memoize_for "exec" fn (fun () -> exec_rule rule_evaluation) in
+    let rule_execution = memoize_for fn (fun () -> exec_rule rule_evaluation) in
     file.rule.exec <-
       Running { rule_evaluation
               ; rule_execution
@@ -1286,14 +1277,14 @@ let build_rules_internal ?(recursive=false) t ~request =
           make_rule rule_evaluation
         | Not_started { eval_rule; exec_rule } ->
           ir.exec <- Starting;
-          let rule_evaluation = memoize_for "eval" fn eval_rule in
+          let rule_evaluation = memoize_for fn eval_rule in
           ir.exec <-
             Evaluating_rule { rule_evaluation
                             ; exec_rule
                             };
           make_rule rule_evaluation
       in
-      let rule = Fiber.memoize "blah" rule in
+      let rule = Fiber.memoize rule in
       rules := rule :: !rules;
       rule >>= fun rule ->
       if recursive then

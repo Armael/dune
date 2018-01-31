@@ -48,24 +48,19 @@ module Execution_context : sig
   type t
 
   val create_initial : unit -> t
-  val forward_error : t -> string -> exn -> unit
+  val forward_error : t -> exn -> unit
 
   val add_refs : t -> int -> unit
   val deref : t -> unit
-  val refs : t -> int
 
   val create_sub
     :  t
     -> on_error:(exn -> unit)
-    -> stack:string list ref
     -> on_release:(unit -> unit)
     -> t
 
   val vars : t -> Binding.t Int_map.t
   val set_vars : t -> Binding.t Int_map.t -> t
-
-  val mark : t -> string -> unit
-  val stack : t -> string list
 end = struct
   type t =
     { on_error : exn -> unit (* This callback must never raise *)
@@ -73,11 +68,7 @@ end = struct
                             context *)
     ; vars     : Binding.t Int_map.t
     ; on_release : unit -> unit
-    ; stack    : string list ref
     }
-
-  let mark t s = t.stack := s :: !(t.stack)
-  let stack t = List.rev !(t.stack)
 
   let vars t = t.vars
   let set_vars t vars = { t with vars }
@@ -86,11 +77,8 @@ end = struct
     { on_error   = reraise
     ; fibers     = ref 0
     ; vars       = Int_map.empty
-    ; stack      = ref []
     ; on_release = ignore
     }
-
-  let refs t = !(t.fibers)
 
   let add_refs t n = t.fibers := !(t.fibers) + n
 
@@ -100,9 +88,8 @@ end = struct
     t.fibers := n;
     if n = 0 then t.on_release ()
 
-  let forward_error t pos exn =
+  let forward_error t exn =
     let bt = Printexc.get_raw_backtrace () in
-    t.stack := pos :: !(t.stack);
     try
       t.on_error exn
     with exn2 ->
@@ -126,12 +113,12 @@ end = struct
          \\%s@."
         line s line
 
-  let forward_error t pos exn =
-    forward_error t pos exn;
+  let forward_error t exn =
+    forward_error t exn;
     deref t
 
-  let create_sub t ~on_error ~stack ~on_release =
-    { t with on_error; stack; on_release; fibers = ref 1 }
+  let create_sub t ~on_error ~on_release =
+    { t with on_error; on_release; fibers = ref 1 }
 end
 
 module EC = Execution_context
@@ -172,7 +159,7 @@ let fork fa fb ctx k =
         | Got_a _ -> assert false
         | Got_b b -> k (a, b))
     with exn ->
-      EC.forward_error ctx "fork" exn
+      EC.forward_error ctx exn
   end;
   fb () ctx (fun b ->
     match !state with
@@ -191,7 +178,7 @@ let fork_unit fa fb ctx k =
         | Got_a _ -> assert false
         | Got_b b -> k b)
     with exn ->
-      EC.forward_error ctx "fork_unit" exn
+      EC.forward_error ctx exn
   end;
   fb () ctx (fun b ->
     match !state with
@@ -231,7 +218,7 @@ let nfork_map l ~f ctx k =
           else
             EC.deref ctx)
       with exn ->
-        EC.forward_error ctx "nfork_map" exn)
+        EC.forward_error ctx exn)
 
 let nfork_iter l ~f ctx k =
   match l with
@@ -249,7 +236,7 @@ let nfork_iter l ~f ctx k =
       try
         f x ctx k
       with exn ->
-        EC.forward_error ctx "nfork_iter" exn)
+        EC.forward_error ctx exn)
 
 module Var = struct
   include Var0
@@ -280,65 +267,33 @@ module Var = struct
     fiber ctx k
 end
 
-let n = ref 0
-let db = Hashtbl.create 128
-
-let () = at_exit (fun () ->
-  if false then
-  Hashtbl.iter db ~f:(fun ~key:n ~data:ctx ->
-    let open Printf in
-    eprintf "------------ %d: %d\n%!" n (EC.refs ctx);
-    List.iter (EC.stack ctx) ~f:(eprintf "%s\n%!")))
-
 let iter_errors_internal (f : unit -> _ t) ~on_error ctx k =
-  incr n;
-  let id = !n in
-  let fibers = ref 1 in
-  let finished = ref false in
-  let stack = ref [] in
-  let check () =
-    if !finished then begin
-      List.iter (List.rev !stack) ~f:prerr_endline;
-      assert false
-    end
-  in
   let on_error exn =
-    check ();
     match on_error with
     | None ->
       EC.add_refs ctx 1;
-      EC.forward_error ctx "iter_errors 1" exn
+      EC.forward_error ctx exn
     | Some f ->
       try
         f exn
       with exn ->
         EC.add_refs ctx 1;
-        EC.forward_error ctx "iter_errors 2" exn
+        EC.forward_error ctx exn
   in
   let result = ref (Error ()) in
   let on_release () =
-    check ();
-    finished := true;
-    stack := "raised" :: !stack;
-    Hashtbl.remove db id;
     try
       k !result
     with exn ->
-      EC.forward_error ctx "iter_errors 3" exn
+      EC.forward_error ctx exn
   in
-  let sub_ctx = EC.create_sub ctx ~on_error ~stack ~on_release in
-  Hashtbl.add db ~key:id ~data:sub_ctx;
+  let sub_ctx = EC.create_sub ctx ~on_error ~on_release in
   try
     f () sub_ctx (fun x ->
-      stack := "done" :: !stack;
-      assert (!fibers = 1);
-      fibers := 0;
-      Hashtbl.remove db id;
       result := Ok x;
       EC.deref sub_ctx);
-    EC.mark sub_ctx "delayed"
   with exn ->
-    EC.forward_error sub_ctx "iter_errors 5" exn
+    EC.forward_error sub_ctx exn
 
 let wait_errors f = iter_errors_internal f ~on_error:None
 let iter_errors f ~on_error = iter_errors_internal f ~on_error:(Some on_error)
@@ -376,7 +331,7 @@ module Handler = struct
     try
       t.run x
     with exn ->
-      EC.forward_error t.ctx "handler" exn
+      EC.forward_error t.ctx exn
 end
 
 module Ivar = struct
@@ -403,20 +358,12 @@ module Ivar = struct
     match t.state with
     | Full  x -> k x
     | Empty q ->
-      EC.mark ctx "read";
       Queue.push { Handler. run = k; ctx } q
 end
 
 exception Already_reported
 
-let n = ref String_set.empty
-let p = ref String_set.empty
-let () = at_exit (fun () ->
-  String_set.iter !n ~f:(Printf.eprintf "empty: %S\n%!"))
-
-let memoize s (t : _ t) : _ t =
-  if String_set.mem s !p then failwith s;
-  p := String_set.add s !p;
+let memoize (t : _ t) : _ t =
   let cell = ref None in
   delay (fun () ->
     match !cell with
@@ -427,9 +374,7 @@ let memoize s (t : _ t) : _ t =
     | None ->
       let ivar = Ivar.create () in
       cell := Some ivar;
-      n := String_set.add s !n;
       wait_errors (fun () -> t) >>= fun res ->
-      n := String_set.remove s !n;
       Ivar.fill ivar res >>| fun () ->
       match res with
       | Ok x -> x
@@ -443,7 +388,6 @@ module Mutex = struct
 
   let lock t ctx k =
     if t.locked then
-      let () = EC.mark ctx "lock" in
       Queue.push { Handler. run = k; ctx } t.waiters
     else begin
       t.locked <- true;
@@ -537,11 +481,9 @@ module Scheduler = struct
     if Running_jobs.count () < !Clflags.concurrency then
       k (Var.find_exn ctx info_var)
     else
-      let () = EC.mark ctx "wait job" in
       Queue.push { Handler. ctx; run = k } waiting_for_available_job
 
   let wait_for_process pid ctx k =
-    let () = EC.mark ctx "wait proc" in
     Running_jobs.add
       { pid
       ; handler = { Handler. ctx; run = k }
