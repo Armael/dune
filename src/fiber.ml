@@ -528,8 +528,10 @@ module Scheduler = struct
     let t = { log; cwd } in
     let fiber =
       Var.set t_var t
-        (iter_errors (fun () -> fiber) ~on_error:(fun exn ->
-           Format.eprintf "%a@?" Report_error.report exn))
+        (iter_errors (fun () -> fiber) ~on_error:(function
+           | Already_reported -> ()
+           | exn ->
+             Format.eprintf "%a@?" Report_error.report exn))
     in
     let result = ref None in
     fiber (Execution_context.create ()) (fun x -> result := Some x);
