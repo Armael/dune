@@ -1132,14 +1132,13 @@ let eval_request t ~request ~process_target =
     Fiber.nfork_iter (Pset.elements ts) ~f:process_target
   in
 
-  Fiber.fork
+  Fiber.fork_unit
     (fun () -> process_targets static_deps)
     (fun () ->
        wait_for_deps t rule_deps
        >>= fun () ->
        let dyn_deps = Build_exec.exec_nop t request () in
        process_targets (Pset.diff dyn_deps static_deps))
-  >>| fun ((), ()) -> ()
 
 let do_build t ~request =
   entry_point t ~f:(fun () ->
