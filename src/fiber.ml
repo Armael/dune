@@ -210,8 +210,8 @@ let iter_errors_internal f ~on_error ctx k =
   let fibers = ref 1 in
   let on_error exn =
     let n = !fibers - 1 in
+    assert (n >= 0);
     fibers := n;
-    assert (n > 0);
     begin
       match on_error with
       | None ->
