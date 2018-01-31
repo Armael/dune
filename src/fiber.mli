@@ -6,8 +6,8 @@ open Import
 
 (** Type of fiber. A fiber represent a suspended computation. Note
     that using the same fiber twice will execute it twice, which is
-    probably not what you want. To share the result of a fiber, use an
-    [Ivar.t].  *)
+    probably not what you want. To share the result of a fiber, use
+    [memoize] or an [Ivar.t].  *)
 type 'a t
 
 (** Create a fiber that has already terminated. *)
