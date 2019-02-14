@@ -50,6 +50,17 @@ module Make(Value : Value) : S with type value := Value.t = struct
     min (float m ** (1.0 /. 2.0)) (float n ** (2.0 /. 3.0)) |> int_of_float
 
   let add dag v w =
+    let instrument =
+      try Unix.getenv "DUNE_INSTRUMENT" = "1" with
+        Not_found -> false in
+    if instrument then begin
+      let pid = Unix.getpid () in
+      let oc = open_out_gen [Open_creat; Open_append] 0o644
+                 (Printf.sprintf "/tmp/dune-%d.log" pid) in
+      Printf.fprintf oc "%d %d\n%!" v.info.id w.info.id;
+      close_out oc;
+    end;
+
     let delta = delta dag in
 
     dag.arcs <- dag.arcs + 1;
